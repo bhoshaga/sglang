@@ -270,6 +270,7 @@ class ServerArgs:
 
     # Compilation
     enable_torch_compile: bool = False
+    enable_piecewise_cuda_graph: bool = False
 
     # warmup
     warmup: bool = False
@@ -738,6 +739,12 @@ class ServerArgs:
             default=ServerArgs.enable_torch_compile,
             help="Use torch.compile to speed up DiT inference."
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+        )
+        parser.add_argument(
+            "--enable-piecewise-cuda-graph",
+            action=StoreBoolean,
+            default=ServerArgs.enable_piecewise_cuda_graph,
+            help="Enable diffusion piecewise CUDA graph (PCG) for image denoising stages.",
         )
 
         # warmup

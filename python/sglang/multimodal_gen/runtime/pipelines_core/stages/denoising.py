@@ -11,6 +11,7 @@ import os
 import time
 import weakref
 from collections.abc import Iterable
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
@@ -83,6 +84,269 @@ from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
 logger = init_logger(__name__)
 
 
+@dataclass
+class _DiffusionPcgGraphEntry:
+    key: tuple[Any, ...]
+    graph: torch.cuda.CUDAGraph
+    static_hidden_states: torch.Tensor
+    static_timestep: torch.Tensor
+    static_guidance: torch.Tensor | None
+    static_kwargs: dict[str, Any]
+    output: Any
+    replay_count: int = 0
+
+
+class _DiffusionPiecewiseCudaGraphRunner:
+    """A lightweight CUDA-graph runner for diffusion forward passes."""
+
+    def __init__(self, logger_obj) -> None:
+        self.logger = logger_obj
+        self._entries: dict[tuple[Any, ...], _DiffusionPcgGraphEntry] = {}
+
+    def _clone_structure_with_tensors(self, obj: Any) -> Any:
+        if isinstance(obj, torch.Tensor):
+            return obj.clone()
+        if isinstance(obj, dict):
+            return {
+                key: self._clone_structure_with_tensors(value)
+                for key, value in obj.items()
+            }
+        if isinstance(obj, list):
+            return [self._clone_structure_with_tensors(item) for item in obj]
+        if isinstance(obj, tuple):
+            return tuple(self._clone_structure_with_tensors(item) for item in obj)
+        return obj
+
+    def _copy_tensor_data(self, src: Any, dst: Any, path: str) -> None:
+        if isinstance(src, torch.Tensor):
+            if not isinstance(dst, torch.Tensor):
+                raise TypeError(f"PCG static tensor mismatch at {path}: {type(dst)}")
+            if src.shape != dst.shape:
+                raise ValueError(
+                    f"PCG tensor shape mismatch at {path}: {src.shape} vs {dst.shape}"
+                )
+            dst.copy_(src)
+            return
+
+        if isinstance(src, dict):
+            if not isinstance(dst, dict):
+                raise TypeError(f"PCG static dict mismatch at {path}: {type(dst)}")
+            for key, value in src.items():
+                if key not in dst:
+                    raise KeyError(f"PCG key missing at {path}.{key}")
+                self._copy_tensor_data(value, dst[key], f"{path}.{key}")
+            return
+
+        if isinstance(src, (list, tuple)):
+            if not isinstance(dst, (list, tuple)):
+                raise TypeError(f"PCG static sequence mismatch at {path}: {type(dst)}")
+            if len(src) != len(dst):
+                raise ValueError(
+                    f"PCG sequence length mismatch at {path}: {len(src)} vs {len(dst)}"
+                )
+            for idx, (s_item, d_item) in enumerate(zip(src, dst)):
+                self._copy_tensor_data(s_item, d_item, f"{path}[{idx}]")
+
+    def _collect_tensor_signatures(
+        self, obj: Any, prefix: str, signatures: list[tuple[str, tuple[int, ...], str]]
+    ) -> None:
+        if isinstance(obj, torch.Tensor):
+            signatures.append((prefix, tuple(obj.shape), str(obj.dtype)))
+            return
+
+        if isinstance(obj, dict):
+            for key in sorted(obj.keys()):
+                self._collect_tensor_signatures(
+                    obj[key], f"{prefix}.{key}", signatures
+                )
+            return
+
+        if isinstance(obj, (list, tuple)):
+            for idx, item in enumerate(obj):
+                self._collect_tensor_signatures(item, f"{prefix}[{idx}]", signatures)
+
+    def build_capture_key(
+        self,
+        *,
+        model: nn.Module,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        guidance: torch.Tensor | None,
+        kwargs: dict[str, Any],
+        capture_tag: str,
+    ) -> tuple[Any, ...]:
+        signatures: list[tuple[str, tuple[int, ...], str]] = []
+        self._collect_tensor_signatures(hidden_states, "hidden_states", signatures)
+        self._collect_tensor_signatures(timestep, "timestep", signatures)
+        if isinstance(guidance, torch.Tensor):
+            self._collect_tensor_signatures(guidance, "guidance", signatures)
+        self._collect_tensor_signatures(kwargs, "kwargs", signatures)
+        signatures.sort(key=lambda x: x[0])
+
+        return (
+            capture_tag,
+            model.__class__.__name__,
+            id(model),
+            tuple(signatures),
+        )
+
+    def ensure_captured(
+        self,
+        *,
+        model: nn.Module,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        guidance: torch.Tensor | None,
+        kwargs: dict[str, Any],
+        capture_tag: str,
+        step_idx: int,
+    ) -> bool:
+        key = self.build_capture_key(
+            model=model,
+            hidden_states=hidden_states,
+            timestep=timestep,
+            guidance=guidance,
+            kwargs=kwargs,
+            capture_tag=capture_tag,
+        )
+        if key in self._entries:
+            self.logger.info(
+                "[Diffusion-PCG] Capture already exists, skip. tag=%s step=%d",
+                capture_tag,
+                step_idx,
+            )
+            return False
+
+        self._capture(
+            key=key,
+            model=model,
+            hidden_states=hidden_states,
+            timestep=timestep,
+            guidance=guidance,
+            kwargs=kwargs,
+            capture_tag=capture_tag,
+            step_idx=step_idx,
+        )
+        return True
+
+    def graph_count(self) -> int:
+        return len(self._entries)
+
+    def replay_or_capture(
+        self,
+        *,
+        model: nn.Module,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        guidance: torch.Tensor | None,
+        kwargs: dict[str, Any],
+        capture_tag: str,
+        step_idx: int,
+    ) -> Any:
+        key = self.build_capture_key(
+            model=model,
+            hidden_states=hidden_states,
+            timestep=timestep,
+            guidance=guidance,
+            kwargs=kwargs,
+            capture_tag=capture_tag,
+        )
+
+        entry = self._entries.get(key)
+        if entry is None:
+            self.logger.info(
+                "[Diffusion-PCG] Missing graph entry, fallback to on-demand capture. tag=%s step=%d",
+                capture_tag,
+                step_idx,
+            )
+            return self._capture(
+                key=key,
+                model=model,
+                hidden_states=hidden_states,
+                timestep=timestep,
+                guidance=guidance,
+                kwargs=kwargs,
+                capture_tag=capture_tag,
+                step_idx=step_idx,
+            )
+
+        entry.static_hidden_states.copy_(hidden_states)
+        entry.static_timestep.copy_(timestep)
+        if isinstance(guidance, torch.Tensor) and entry.static_guidance is not None:
+            entry.static_guidance.copy_(guidance)
+        self._copy_tensor_data(kwargs, entry.static_kwargs, "kwargs")
+
+        entry.graph.replay()
+        entry.replay_count += 1
+        if entry.replay_count <= 5 or entry.replay_count % 10 == 0:
+            self.logger.info(
+                "[Diffusion-PCG] Replay success. tag=%s step=%d replay_count=%d",
+                capture_tag,
+                step_idx,
+                entry.replay_count,
+            )
+        return entry.output
+
+    def _capture(
+        self,
+        *,
+        key: tuple[Any, ...],
+        model: nn.Module,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        guidance: torch.Tensor | None,
+        kwargs: dict[str, Any],
+        capture_tag: str,
+        step_idx: int,
+    ) -> Any:
+        self.logger.info(
+            "[Diffusion-PCG] Capture start. tag=%s step=%d tensors=%s",
+            capture_tag,
+            step_idx,
+            key[-1],
+        )
+
+        static_hidden_states = hidden_states.clone()
+        static_timestep = timestep.clone()
+        static_guidance = guidance.clone() if isinstance(guidance, torch.Tensor) else None
+        static_kwargs = self._clone_structure_with_tensors(kwargs)
+
+        _ = model(
+            hidden_states=static_hidden_states,
+            timestep=static_timestep,
+            guidance=static_guidance,
+            **static_kwargs,
+        )
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = model(
+                hidden_states=static_hidden_states,
+                timestep=static_timestep,
+                guidance=static_guidance,
+                **static_kwargs,
+            )
+
+        self._entries[key] = _DiffusionPcgGraphEntry(
+            key=key,
+            graph=graph,
+            static_hidden_states=static_hidden_states,
+            static_timestep=static_timestep,
+            static_guidance=static_guidance,
+            static_kwargs=static_kwargs,
+            output=output,
+        )
+
+        self.logger.info(
+            "[Diffusion-PCG] Capture done. tag=%s step=%d total_graphs=%d",
+            capture_tag,
+            step_idx,
+            len(self._entries),
+        )
+        return output
+
+
 class DenoisingStage(PipelineStage):
     """
     Stage for running the denoising loop in diffusion pipelines.
@@ -127,6 +391,9 @@ class DenoisingStage(PipelineStage):
         self._cache_dit_enabled = False
         self._cached_num_steps = None
         self._is_warmed_up = False
+        self._piecewise_cuda_graph_runner: _DiffusionPiecewiseCudaGraphRunner | None = (
+            None
+        )
 
     def _maybe_enable_torch_compile(self, module: object) -> None:
         """
@@ -348,6 +615,193 @@ class DenoisingStage(PipelineStage):
             ).to(target_dtype)
             * 1000.0
         )
+
+    def _should_enable_piecewise_cuda_graph(
+        self, batch: Req, server_args: ServerArgs
+    ) -> bool:
+        if not getattr(server_args, "enable_piecewise_cuda_graph", False):
+            return False
+        if batch.is_warmup:
+            return False
+        if not current_platform.is_cuda_alike():
+            self.log_info(
+                "[Diffusion-PCG] Disabled: current platform is not CUDA-like (%s)",
+                current_platform.device_type,
+            )
+            return False
+        if not server_args.pipeline_config.task_type.is_image_gen():
+            self.log_info(
+                "[Diffusion-PCG] Disabled: task_type=%s is not image generation",
+                server_args.pipeline_config.task_type,
+            )
+            return False
+        if get_world_size() != 1:
+            self.log_info(
+                "[Diffusion-PCG] Disabled: currently only supports single-rank. world_size=%d",
+                get_world_size(),
+            )
+            return False
+        if self.attn_backend.get_enum() != AttentionBackendEnum.FA:
+            self.log_info(
+                "[Diffusion-PCG] Disabled: currently only supports FA backend. backend=%s",
+                self.attn_backend.get_enum(),
+            )
+            return False
+        return True
+
+    def _maybe_prepare_piecewise_cuda_graph(
+        self,
+        *,
+        batch: Req,
+        server_args: ServerArgs,
+        timesteps: torch.Tensor,
+        timesteps_cpu: torch.Tensor,
+        target_dtype: torch.dtype,
+        image_kwargs: dict[str, Any],
+        pos_cond_kwargs: dict[str, Any],
+        neg_cond_kwargs: dict[str, Any],
+        latents: torch.Tensor,
+        boundary_timestep: float | None,
+        seq_len: int | None,
+        reserved_frames_mask,
+        guidance: torch.Tensor | None,
+    ) -> None:
+        if not self._should_enable_piecewise_cuda_graph(batch, server_args):
+            self._piecewise_cuda_graph_runner = None
+            return
+
+        if self._piecewise_cuda_graph_runner is None:
+            self._piecewise_cuda_graph_runner = _DiffusionPiecewiseCudaGraphRunner(logger)
+
+        cfg_rank = get_classifier_free_guidance_rank()
+        need_positive = not (server_args.enable_cfg_parallel and cfg_rank != 0)
+        need_negative = batch.do_classifier_free_guidance and (
+            (not server_args.enable_cfg_parallel) or (cfg_rank != 0)
+        )
+        if not need_positive and not need_negative:
+            return
+
+        candidate_indices = [0]
+        if self.transformer_2 is not None and boundary_timestep is not None:
+            low_noise_indices = (timesteps_cpu < boundary_timestep).nonzero(as_tuple=False)
+            if low_noise_indices.numel() > 0:
+                low_noise_first_idx = int(low_noise_indices[0].item())
+                if low_noise_first_idx not in candidate_indices:
+                    candidate_indices.append(low_noise_first_idx)
+
+        self.log_info(
+            "[Diffusion-PCG] Pre-capture begin before denoising. "
+            "need_positive=%s need_negative=%s candidate_steps=%s",
+            need_positive,
+            need_negative,
+            candidate_indices,
+        )
+
+        previous_is_cfg_negative = getattr(batch, "is_cfg_negative", False)
+        pre_capture_cache_hit = 0
+        pre_capture_cache_miss = 0
+        try:
+            for capture_step_idx in candidate_indices:
+                t_int = int(timesteps_cpu[capture_step_idx].item())
+                t_device = timesteps[capture_step_idx]
+                current_model, _ = self._select_and_manage_model(
+                    t_int=t_int,
+                    boundary_timestep=boundary_timestep,
+                    server_args=server_args,
+                    batch=batch,
+                )
+
+                latent_model_input = latents.to(target_dtype)
+                if batch.image_latent is not None:
+                    latent_model_input = torch.cat(
+                        [latent_model_input, batch.image_latent], dim=1
+                    ).to(target_dtype)
+
+                timestep = self.expand_timestep_before_forward(
+                    batch,
+                    server_args,
+                    t_device,
+                    target_dtype,
+                    seq_len,
+                    reserved_frames_mask,
+                )
+                latent_model_input = self.scheduler.scale_model_input(
+                    latent_model_input, t_device
+                )
+
+                attn_metadata = self._build_attn_metadata(
+                    capture_step_idx,
+                    batch,
+                    server_args,
+                    timestep_value=t_int,
+                    timesteps=timesteps_cpu,
+                )
+
+                self.log_info(
+                    "[Diffusion-PCG] Pre-capture step=%d timestep=%d model=%s",
+                    capture_step_idx,
+                    t_int,
+                    current_model.__class__.__name__,
+                )
+
+                if need_positive:
+                    batch.is_cfg_negative = False
+                    with set_forward_context(
+                        current_timestep=capture_step_idx,
+                        attn_metadata=attn_metadata,
+                        forward_batch=batch,
+                    ):
+                        did_capture = self._piecewise_cuda_graph_runner.ensure_captured(
+                            model=current_model,
+                            hidden_states=latent_model_input,
+                            timestep=timestep,
+                            guidance=guidance,
+                            kwargs={**image_kwargs, **pos_cond_kwargs},
+                            capture_tag="cfg_positive",
+                            step_idx=capture_step_idx,
+                        )
+                        if did_capture:
+                            pre_capture_cache_miss += 1
+                        else:
+                            pre_capture_cache_hit += 1
+
+                if need_negative:
+                    batch.is_cfg_negative = True
+                    with set_forward_context(
+                        current_timestep=capture_step_idx,
+                        attn_metadata=attn_metadata,
+                        forward_batch=batch,
+                    ):
+                        did_capture = self._piecewise_cuda_graph_runner.ensure_captured(
+                            model=current_model,
+                            hidden_states=latent_model_input,
+                            timestep=timestep,
+                            guidance=guidance,
+                            kwargs={**image_kwargs, **neg_cond_kwargs},
+                            capture_tag="cfg_negative",
+                            step_idx=capture_step_idx,
+                        )
+                        if did_capture:
+                            pre_capture_cache_miss += 1
+                        else:
+                            pre_capture_cache_hit += 1
+
+            total_attempts = pre_capture_cache_hit + pre_capture_cache_miss
+            self.log_info(
+                "[Diffusion-PCG] Pre-capture summary: attempts=%d cache_hit=%d cache_miss=%d total_graphs=%d",
+                total_attempts,
+                pre_capture_cache_hit,
+                pre_capture_cache_miss,
+                self._piecewise_cuda_graph_runner.graph_count(),
+            )
+            self.log_info("[Diffusion-PCG] Pre-capture finished before denoising loop")
+        except Exception:
+            logger.exception(
+                "[Diffusion-PCG] Pre-capture failed. Fallback to eager execution."
+            )
+            self._piecewise_cuda_graph_runner = None
+        finally:
+            batch.is_cfg_negative = previous_is_cfg_negative
 
     def get_or_build_guidance(self, bsz: int, dtype, device):
         """
@@ -1007,6 +1461,21 @@ class DenoisingStage(PipelineStage):
             dtype=target_dtype,
             enabled=autocast_enabled,
         ):
+            self._maybe_prepare_piecewise_cuda_graph(
+                batch=batch,
+                server_args=server_args,
+                timesteps=timesteps,
+                timesteps_cpu=timesteps_cpu,
+                target_dtype=target_dtype,
+                image_kwargs=image_kwargs,
+                pos_cond_kwargs=pos_cond_kwargs,
+                neg_cond_kwargs=neg_cond_kwargs,
+                latents=latents,
+                boundary_timestep=boundary_timestep,
+                seq_len=seq_len,
+                reserved_frames_mask=reserved_frames_mask,
+                guidance=guidance,
+            )
             with self.progress_bar(total=num_inference_steps) as progress_bar:
                 for i, t_host in enumerate(timesteps_cpu):
                     with StageProfiler(
@@ -1338,8 +1807,22 @@ class DenoisingStage(PipelineStage):
         timestep,
         target_dtype,
         guidance: torch.Tensor,
+        batch: Req,
+        timestep_index: int,
+        capture_tag: str = "cfg_positive",
         **kwargs,
     ):
+        if self._piecewise_cuda_graph_runner is not None:
+            return self._piecewise_cuda_graph_runner.replay_or_capture(
+                model=current_model,
+                hidden_states=latent_model_input,
+                timestep=timestep,
+                guidance=guidance,
+                kwargs=kwargs,
+                capture_tag=capture_tag,
+                step_idx=timestep_index,
+            )
+
         return current_model(
             hidden_states=latent_model_input,
             timestep=timestep,
@@ -1400,6 +1883,9 @@ class DenoisingStage(PipelineStage):
                     timestep=timestep,
                     target_dtype=target_dtype,
                     guidance=guidance,
+                    batch=batch,
+                    timestep_index=timestep_index,
+                    capture_tag="cfg_positive",
                     **image_kwargs,
                     **pos_cond_kwargs,
                 )
@@ -1425,6 +1911,9 @@ class DenoisingStage(PipelineStage):
                     timestep=timestep,
                     target_dtype=target_dtype,
                     guidance=guidance,
+                    batch=batch,
+                    timestep_index=timestep_index,
+                    capture_tag="cfg_negative",
                     **image_kwargs,
                     **neg_cond_kwargs,
                 )
