@@ -37,6 +37,7 @@ class SGLangCheckpointEngineWorkerExtension:
     """
     Worker extension for SGLang to support checkpoint-engine IPC weight updates.
     This class provides the interface needed for checkpoint-engine integration.
+    
     """
 
     def __init__(self):
