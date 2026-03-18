@@ -24,7 +24,9 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -596,17 +598,36 @@ def run_single(
     env.update(fw_cfg.get("extra_env", {}))
 
     log_file = log_dir / f"{case['id']}_{framework}.log"
-    log_fh = open(log_file, "w")
+    log_fh = open(log_file, "w", encoding="utf-8", buffering=1)
+    log_thread = None
 
     proc = None
     try:
         proc = subprocess.Popen(
             cmd,
-            stdout=log_fh,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             env=env,
             preexec_fn=os.setsid,
+            text=True,
+            bufsize=1,
         )
+
+        # Tee server output to both log file and stdout (like test_server_utils)
+        def _log_pipe(pipe, fh):
+            try:
+                for line in iter(pipe.readline, ""):
+                    sys.stdout.write(f"  [server] {line}")
+                    sys.stdout.flush()
+                    fh.write(line)
+            except ValueError:
+                pass  # pipe closed
+
+        log_thread = threading.Thread(
+            target=_log_pipe, args=(proc.stdout, log_fh)
+        )
+        log_thread.daemon = True
+        log_thread.start()
 
         base_url = f"http://{DEFAULT_HOST}:{port}"
         wait_for_health(base_url, framework)
@@ -629,6 +650,8 @@ def run_single(
     finally:
         if proc:
             kill_server(proc)
+        if log_thread:
+            log_thread.join(timeout=5)
         log_fh.close()
 
     return result
