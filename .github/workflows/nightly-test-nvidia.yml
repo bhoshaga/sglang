@@ -616,7 +616,7 @@ jobs:
   # Diffusion cross-framework comparison
   nightly-test-diffusion-comparison:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-diffusion-comparison')
-    runs-on: 4-gpu-runner
+    runs-on: 4-gpu-h100
     timeout-minutes: 180
     steps:
       - name: Checkout code
