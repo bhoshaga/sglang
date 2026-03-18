@@ -163,9 +163,7 @@ def generate_dashboard(
     lines.append("# Diffusion Cross-Framework Performance Dashboard\n")
     ts = current.get("timestamp", datetime.now(timezone.utc).isoformat())
     sha = current.get("commit_sha", "unknown")
-    lines.append(
-        f"*Generated: {_short_date(ts)} | Commit: `{_short_sha(sha)}`*\n"
-    )
+    lines.append(f"*Generated: {_short_date(ts)} | Commit: `{_short_sha(sha)}`*\n")
 
     current_cases = _extract_case_results(current)
     case_ids = list(current_cases.keys())
@@ -310,7 +308,7 @@ def generate_dashboard(
             lines.append(f'  title "Latency Trend — {cid}"')
             lines.append("  x-axis [{}]".format(", ".join(f'"{d}"' for d in dates)))
             max_val = max(max(sg_vals), max(vl_vals)) * 1.2 if sg_vals else 100
-            lines.append(f"  y-axis \"Latency (s)\" 0 --> {max_val:.0f}")
+            lines.append(f'  y-axis "Latency (s)" 0 --> {max_val:.0f}')
             lines.append(f"  line [{', '.join(f'{v:.2f}' for v in sg_vals)}]")
             lines.append(f"  line [{', '.join(f'{v:.2f}' for v in vl_vals)}]")
             lines.append("```")

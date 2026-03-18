@@ -113,7 +113,9 @@ def publish_comparison(
             )
 
             update_branch_ref(REPO_OWNER, REPO_NAME, BRANCH, commit_sha, token)
-            print(f"Successfully published comparison results (commit {commit_sha[:7]})")
+            print(
+                f"Successfully published comparison results (commit {commit_sha[:7]})"
+            )
             return
 
         except Exception as e:

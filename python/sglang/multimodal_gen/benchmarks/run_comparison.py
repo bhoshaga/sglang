@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Cross-framework comparison benchmark for diffusion serving.
 
 Launches servers (SGLang, vLLM-Omni, LightX2V) for each test case, sends a
@@ -19,17 +18,16 @@ Usage:
 """
 
 import argparse
+import base64
+import io
 import json
 import os
 import signal
 import subprocess
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-
-import base64
-import io
-import tempfile
 
 import requests
 
@@ -37,7 +35,9 @@ import requests
 # Constants
 # ---------------------------------------------------------------------------
 CONFIGS_PATH = Path(__file__).parent / "comparison_configs.json"
-INSTALL_SCRIPT = Path(__file__).parents[4] / "scripts" / "ci" / "install_comparison_frameworks.sh"
+INSTALL_SCRIPT = (
+    Path(__file__).parents[4] / "scripts" / "ci" / "install_comparison_frameworks.sh"
+)
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 30000
 HEALTH_TIMEOUT = 1200  # seconds
@@ -531,9 +531,7 @@ def send_request_lightx2v(base_url: str, case: dict, config: dict) -> float:
         elif status in ("FAILED", "CANCELLED"):
             raise RuntimeError(f"LightX2V task {status}: {poll_data}")
         if time.time() - start > REQUEST_TIMEOUT:
-            raise TimeoutError(
-                f"LightX2V task timed out after {REQUEST_TIMEOUT}s"
-            )
+            raise TimeoutError(f"LightX2V task timed out after {REQUEST_TIMEOUT}s")
 
     latency = time.time() - start
     print(f"  Generated in {latency:.2f}s (lightx2v)")
@@ -706,14 +704,16 @@ def run_comparison(
             if not _install_framework(fw_name, dry_run):
                 # Skip all cases for this framework
                 for case, _ in pairs:
-                    results.append({
-                        "case_id": case["id"],
-                        "framework": fw_name,
-                        "model": case["model"],
-                        "task": case["task"],
-                        "latency_s": None,
-                        "error": f"{fw_name} installation failed",
-                    })
+                    results.append(
+                        {
+                            "case_id": case["id"],
+                            "framework": fw_name,
+                            "model": case["model"],
+                            "task": case["task"],
+                            "latency_s": None,
+                            "error": f"{fw_name} installation failed",
+                        }
+                    )
                 continue
             installed_fws.add(fw_name)
 
@@ -725,14 +725,16 @@ def run_comparison(
             if dry_run:
                 cmd = build_server_cmd(fw_name, case, fw_cfg, port)
                 print(f"  [DRY-RUN] Would run: {' '.join(cmd)}")
-                results.append({
-                    "case_id": case["id"],
-                    "framework": fw_name,
-                    "model": case["model"],
-                    "task": case["task"],
-                    "latency_s": None,
-                    "error": "dry-run",
-                })
+                results.append(
+                    {
+                        "case_id": case["id"],
+                        "framework": fw_name,
+                        "model": case["model"],
+                        "task": case["task"],
+                        "latency_s": None,
+                        "error": "dry-run",
+                    }
+                )
                 continue
 
             result = run_single(case, fw_name, fw_cfg, port, log_dir, config)
