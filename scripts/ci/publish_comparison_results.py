@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Publish diffusion comparison results to sglang-bot/sglang-ci-data repo.
 
 Pushes comparison-results.json and dashboard.md to the ci-data repository
