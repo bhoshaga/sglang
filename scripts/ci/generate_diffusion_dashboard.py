@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Generate a Markdown dashboard for diffusion cross-framework comparisons.
 
 Reads current comparison results + historical data from sglang-ci-data repo
