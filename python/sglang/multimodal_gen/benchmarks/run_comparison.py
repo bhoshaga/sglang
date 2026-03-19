@@ -653,9 +653,7 @@ def run_single(
     # perf_dump_path for SGLang server-side timing (passed in request, zero overhead when None)
     perf_dump_path = None
     if framework == "sglang":
-        perf_dump_path = os.path.join(
-            str(log_dir), f"perf_{case['id']}_measured.json"
-        )
+        perf_dump_path = os.path.join(str(log_dir), f"perf_{case['id']}_measured.json")
 
     log_file = log_dir / f"{case['id']}_{framework}.log"
     log_fh = open(log_file, "w", encoding="utf-8", buffering=1)
@@ -683,9 +681,7 @@ def run_single(
             except ValueError:
                 pass  # pipe closed
 
-        log_thread = threading.Thread(
-            target=_log_pipe, args=(proc.stdout, log_fh)
-        )
+        log_thread = threading.Thread(target=_log_pipe, args=(proc.stdout, log_fh))
         log_thread.daemon = True
         log_thread.start()
 

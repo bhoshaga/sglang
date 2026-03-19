@@ -17,10 +17,6 @@
         "sglang": {
           "serve_args": "--enable-torch-compile --warmup --dit-layerwise-offload false",
           "extra_env": {}
-        },
-        "vllm-omni": {
-          "serve_args": "",
-          "extra_env": {}
         }
       }
     },
@@ -38,10 +34,6 @@
       "frameworks": {
         "sglang": {
           "serve_args": "--enable-torch-compile --warmup",
-          "extra_env": {}
-        },
-        "vllm-omni": {
-          "serve_args": "",
           "extra_env": {}
         }
       }
@@ -61,10 +53,6 @@
       "frameworks": {
         "sglang": {
           "serve_args": "--enable-torch-compile --warmup --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory",
-          "extra_env": {}
-        },
-        "vllm-omni": {
-          "serve_args": "--tensor-parallel-size 4",
           "extra_env": {}
         }
       }

@@ -299,7 +299,11 @@ class GPUWorker:
                     PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
 
             # Dump per-request perf report to specified file (server mode)
-            if req.perf_dump_path is not None and not req.is_warmup and output_batch.metrics is not None:
+            if (
+                req.perf_dump_path is not None
+                and not req.is_warmup
+                and output_batch.metrics is not None
+            ):
                 PerformanceLogger.dump_benchmark_report(
                     file_path=req.perf_dump_path,
                     metrics=output_batch.metrics,
