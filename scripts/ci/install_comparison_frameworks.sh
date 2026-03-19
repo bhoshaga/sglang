@@ -22,7 +22,7 @@ install_vllm_omni() {
     pip install --force-reinstall --no-deps "vllm-omni==0.16.0" 2>&1 | tail -3 || echo "WARNING: vllm-omni install failed"
 
     # Install lightweight deps that vllm-omni needs at runtime
-    pip install aenum omegaconf prettytable torchsde 2>&1 | tail -3 || true
+    pip install aenum cachetools cbor2 omegaconf prettytable torchsde 2>&1 | tail -3 || true
 
     echo "=== vllm-omni installation complete ==="
 }
