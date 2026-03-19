@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.hybrid_cache import (
     ComponentData,
     FullComponent,
     MambaComponent,
+    SWAComponent,
     get_last_access_time,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
@@ -183,7 +184,7 @@ class HybridLRUList:
 COMPONENT_REGISTRY = {
     BASE_COMPONENT_NAME: FullComponent,
     "mamba": MambaComponent,
-    # "swa": xx,
+    "swa": SWAComponent,
 }
 
 logger = logging.getLogger(__name__)
@@ -556,7 +557,7 @@ class HybridRadixCache(BasePrefixCache):
                     break
             if not can_delete:
                 break
-            
+
             for comp in self.components.values():
                 if comp.node_has_component_data(parent):
                     self._evict_component_and_detach_lru(

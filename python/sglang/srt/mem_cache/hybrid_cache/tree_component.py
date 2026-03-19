@@ -86,7 +86,7 @@ class TreeComponent(ABC):
         best_value_len: int,
     ) -> MatchResult:
         """Post-process the match result after prefix matching completes.
-        - Full: pass through unchanged.
+        - Full & SWA: pass through unchanged.
         - Mamba: performs copy-on-write — allocates a new mamba slot, copies
           the matched node's mamba state into the request pool, and records
           branching_seqlen in result."""
