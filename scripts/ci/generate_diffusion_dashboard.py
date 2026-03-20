@@ -377,9 +377,7 @@ def generate_dashboard(
                         speedups.append(vl / sg)
                     else:
                         speedups.append(1.0)
-                lines.append(
-                    f"  line [{', '.join(f'{v:.2f}' for v in speedups)}]"
-                )
+                lines.append(f"  line [{', '.join(f'{v:.2f}' for v in speedups)}]")
 
             lines.append("```")
             case_legend = ", ".join(

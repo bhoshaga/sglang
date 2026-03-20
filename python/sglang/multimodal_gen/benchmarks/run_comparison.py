@@ -42,7 +42,9 @@ INSTALL_SCRIPT = (
 )
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 30000
-HEALTH_TIMEOUT = 2400  # seconds (40 min — FLUX.2-dev needs ~10 min download + torch.compile)
+HEALTH_TIMEOUT = (
+    2400  # seconds (40 min — FLUX.2-dev needs ~10 min download + torch.compile)
+)
 REQUEST_TIMEOUT = 1200  # seconds
 GPU_CLEAR_WAIT = 15  # seconds between framework runs
 
@@ -230,9 +232,7 @@ def wait_for_health(
             except requests.exceptions.RequestException:
                 pass
             if time.time() - start > timeout:
-                raise TimeoutError(
-                    f"Model at {models_url} not ready within {timeout}s"
-                )
+                raise TimeoutError(f"Model at {models_url} not ready within {timeout}s")
             time.sleep(2)
 
     elapsed = time.time() - start
