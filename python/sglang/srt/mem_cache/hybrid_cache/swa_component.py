@@ -161,6 +161,9 @@ class SWAComponent(TreeComponent):
             node.set_component_value(self.name, None)
         return freed
 
+    def eviction_priority(self, is_leaf: bool) -> int:
+        return 0 if is_leaf else 1
+
     def drive_eviction(self, params: EvictParams, tracker: dict[str, int]) -> None:
         request = params.swa_num_tokens
         lru = self.cache.lru_lists[self.name]
@@ -172,9 +175,9 @@ class SWAComponent(TreeComponent):
                 self.cache._evict_component_and_detach_lru(
                     x, self, is_leaf=False, tracker=tracker
                 )
+                self.cache._cascade_evict(x, self, tracker)
                 x = x_next
             else:
-                # Leaf: evict SWA, cascade to all components
                 self.cache._evict_component_and_detach_lru(
                     x, self, is_leaf=True, tracker=tracker
                 )

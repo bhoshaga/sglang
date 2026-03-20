@@ -188,11 +188,27 @@ class TreeComponent(ABC):
         """Eviction priority on this node type. Higher = evicted later.
         When a component is evicted, all other components with equal or
         lower priority on the same node are also cascade-evicted.
-        Leaf: all components equal (0) — evicting any cascades to all.
-        Internal: full=1, others=0 — evicting mamba cascades to swa,
-        but not full.
-        - Full: leaf=0, internal=1.
-        - Mamba/SWA: always 0."""
+
+        Leaf: all components equal (0) — evicting any cascades to all,
+        because the node will be deleted.
+
+        Internal: full=2 > swa=1 > mamba=0.
+        Why swa > mamba: SWA data on internal nodes is *path data* —
+        the sliding window needs continuous SWA coverage along the path
+        from root to the match boundary. E.g. A->B->C->D->E where C
+        and E both have mamba and the window covers C->E: if C's mamba
+        is evicted, C's SWA must stay so E remains reachable.
+        Mamba data, by contrast, is only meaningful at the match
+        boundary node; on internal nodes it
+        contributes nothing to the path. So SWA is more valuable to
+        keep and should be evicted later.
+
+        Cascade consequences:
+        - Mamba evict internal: no cascade.
+        - SWA evict internal: cascades to Mamba. SWA gone -> SWA
+          validator fails -> mamba data is useless (match requires all
+          validators to pass).
+        - Full evict internal: cascades to SWA + Mamba."""
         return 0
 
     @abstractmethod

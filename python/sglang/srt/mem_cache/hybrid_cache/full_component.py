@@ -36,7 +36,7 @@ class FullComponent(TreeComponent):
         return freed
 
     def eviction_priority(self, is_leaf: bool) -> int:
-        return 0 if is_leaf else 1
+        return 0 if is_leaf else 2
 
     def drive_eviction(self, params: EvictParams, tracker: dict[str, int]) -> None:
         request = params.num_tokens

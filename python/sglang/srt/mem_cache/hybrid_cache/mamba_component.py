@@ -126,9 +126,9 @@ class MambaComponent(TreeComponent):
                 self.cache._evict_component_and_detach_lru(
                     x, self, is_leaf=False, tracker=tracker
                 )
+                self.cache._cascade_evict(x, self, tracker)
                 x = x_next
             else:
-                # Leaf: evict self, cascade to all components
                 self.cache._evict_component_and_detach_lru(
                     x, self, is_leaf=True, tracker=tracker
                 )
