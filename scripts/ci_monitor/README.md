@@ -167,7 +167,7 @@ python ci_failures_analysis.py --token $GITHUB_TOKEN --limit 500 --threshold 3
 
 The Failures Analyzer monitors the following workflows:
 
-- **PR Test** - Nvidia GPU tests (self-hosted runners: 1-gpu-runner, 4-gpu-h100-runner, etc.)
+- **PR Test** - Nvidia GPU tests (self-hosted runners: 1-gpu-h100, 1-gpu-5090, 4-gpu-h100-runner, etc.)
 - **PR Test (AMD)** - AMD GPU tests (AMD-specific runners)
 - **PR Test (Xeon)** - Intel Xeon CPU tests (Xeon-specific runners)
 

@@ -333,7 +333,7 @@ jobs:
         id: wait
         with:
           stage-name: stage-a
-          jobs: '["stage-a-test-1", "stage-a-cpu-only"]'
+          jobs: '["stage-a-test-small-1-gpu", "stage-a-test-cpu-only"]'
           max-wait-minutes: '240'
 
   wait-for-stage-b:
@@ -493,10 +493,10 @@ jobs:
       inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
     env:
-      RUNNER_LABELS: 1-gpu-runner
+      RUNNER_LABELS: 1-gpu-h100
     steps:
       - uses: actions/checkout@v4
         with:
@@ -533,10 +533,10 @@ jobs:
       inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
     env:
-      RUNNER_LABELS: 1-gpu-runner
+      RUNNER_LABELS: 1-gpu-h100
     steps:
       - uses: actions/checkout@v4
         with:
@@ -573,11 +573,10 @@ jobs:
       inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
     env:
-      CI: true
-      RUNNER_LABELS: 1-gpu-runner
+      RUNNER_LABELS: 1-gpu-h100
     steps:
       - uses: actions/checkout@v4
         with:
@@ -606,7 +605,7 @@ jobs:
           cd sgl-kernel/benchmark
           echo "Running sgl-kernel benchmark tests in CI mode..."
 
-          echo "CI environment variable: $CI"
+          echo "SGLANG_IS_IN_CI environment variable: $SGLANG_IS_IN_CI"
           echo "GITHUB_ACTIONS environment variable: $GITHUB_ACTIONS"
 
           for bench_file in bench_*.py; do
@@ -699,10 +698,10 @@ jobs:
       inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.jit_kernel == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
     env:
-      RUNNER_LABELS: 1-gpu-runner
+      RUNNER_LABELS: 1-gpu-h100
     steps:
       - uses: actions/checkout@v4
         with:
@@ -724,10 +723,10 @@ jobs:
     if: |
       github.event_name == 'schedule' &&
       needs.check-changes.outputs.jit_kernel == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
     env:
-      RUNNER_LABELS: 1-gpu-runner
+      RUNNER_LABELS: 1-gpu-h100
       SGLANG_JIT_KERNEL_RUN_FULL_TESTS: "1"
     steps:
       - uses: actions/checkout@v4
@@ -753,11 +752,10 @@ jobs:
       inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.jit_kernel == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
     env:
-      CI: true
-      RUNNER_LABELS: 1-gpu-runner
+      RUNNER_LABELS: 1-gpu-h100
     steps:
       - uses: actions/checkout@v4
         with:
@@ -794,22 +792,24 @@ jobs:
 
   # =============================================== primary ====================================================
 
-  stage-a-test-1:
+  # Runs on 5090 (32GB, SM120) — small / smoke CUDA tests (moved from H100 runner)
+  stage-a-test-small-1-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-a-test-1') ||
+        (inputs.target_stage == 'stage-a-test-small-1-gpu') ||
         (
           !inputs.target_stage &&
           ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-5090
     timeout-minutes: 240
     env:
-      RUNNER_LABELS: 1-gpu-runner
+      RUNNER_LABELS: 1-gpu-5090
+      IS_BLACKWELL: "1"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -827,29 +827,29 @@ jobs:
       - name: Install dependencies
         timeout-minutes: 20
         run: |
+          source /etc/profile.d/sglang-ci.sh
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 10
         run: |
+          source /etc/profile.d/sglang-ci.sh
           cd test/
           CONTINUE_ON_ERROR_FLAG=""
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --hw cuda --suite stage-a-test-1 $CONTINUE_ON_ERROR_FLAG
-          # temporarily put backend-independent cpu tests here
-          python3 run_suite.py --hw cpu --suite default $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-a-test-small-1-gpu $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
 
-  stage-a-cpu-only:
+  stage-a-test-cpu-only:
     needs: [check-changes, call-gate]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-a-cpu-only') ||
+        (inputs.target_stage == 'stage-a-test-cpu-only') ||
         (
           !inputs.target_stage &&
           ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
@@ -887,7 +887,7 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --hw cpu --suite stage-a-cpu-only $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cpu --suite stage-a-test-cpu-only $CONTINUE_ON_ERROR_FLAG
 
   # Runs on 5090 (32GB, SM120)
   stage-b-test-small-1-gpu:
@@ -964,10 +964,10 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
     env:
-      RUNNER_LABELS: 1-gpu-runner
+      RUNNER_LABELS: 1-gpu-h100
     strategy:
       fail-fast: false
       max-parallel: ${{ fromJson(needs.check-changes.outputs.max_parallel) }}
@@ -1019,10 +1019,10 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 2-gpu-runner
+    runs-on: 2-gpu-h100
     timeout-minutes: 240
     env:
-      RUNNER_LABELS: 2-gpu-runner
+      RUNNER_LABELS: 2-gpu-h100
     strategy:
       fail-fast: false
       matrix:
@@ -1132,7 +1132,7 @@ jobs:
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
     strategy:
       fail-fast: false
@@ -1189,7 +1189,7 @@ jobs:
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
-    runs-on: 2-gpu-runner
+    runs-on: 2-gpu-h100
     timeout-minutes: 240
     strategy:
       fail-fast: false
@@ -1247,7 +1247,7 @@ jobs:
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     timeout-minutes: 120
     steps:
       - name: Checkout code
@@ -1702,8 +1702,8 @@ jobs:
         multimodal-gen-test-1-gpu,
         multimodal-gen-test-2-gpu,
 
-        stage-a-test-1,
-        stage-a-cpu-only,
+        stage-a-test-small-1-gpu,
+        stage-a-test-cpu-only,
         stage-b-test-small-1-gpu,
         stage-b-test-large-1-gpu,
         stage-b-test-large-2-gpu,

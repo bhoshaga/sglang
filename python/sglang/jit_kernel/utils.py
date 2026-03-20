@@ -15,7 +15,7 @@ _FULL_TEST_ENV_VAR = "SGLANG_JIT_KERNEL_RUN_FULL_TESTS"
 
 
 def is_in_ci() -> bool:
-    ci_env_vars = ("SGLANG_IS_IN_CI", "CI", "GITHUB_ACTIONS")
+    ci_env_vars = ("SGLANG_IS_IN_CI", "GITHUB_ACTIONS")
     return any(os.getenv(env_var, "false").lower() == "true" for env_var in ci_env_vars)
 
 

@@ -102,7 +102,7 @@ class SGLangCIAnalyzer:
                 "sgl-kernel-build-wheels",
             ],
             "unit-test": [
-                "stage-a-test-1",
+                "stage-a-test-small-1-gpu",
                 "unit-test-backend-1-gpu",
                 "unit-test-backend-2-gpu",
                 "stage-b-test-4-gpu-b200",
@@ -211,7 +211,7 @@ class SGLangCIAnalyzer:
                     "sgl-kernel-unit-test",
                     "sgl-kernel-mla-test",
                     "sgl-kernel-benchmark-test",
-                    "stage-a-test-1",
+                    "stage-a-test-small-1-gpu",
                     "unit-test-backend-1-gpu",
                     "unit-test-backend-2-gpu",
                     "stage-b-test-4-gpu-b200",

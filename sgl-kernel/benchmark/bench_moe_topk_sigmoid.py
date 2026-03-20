@@ -8,7 +8,7 @@ from sgl_kernel import topk_sigmoid
 
 # CI environment detection
 IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
+    os.getenv("SGLANG_IS_IN_CI", "false").lower() == "true"
     or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
 )
 

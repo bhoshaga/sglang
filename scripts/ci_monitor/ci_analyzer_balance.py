@@ -174,7 +174,7 @@ class SGLangTestBalanceAnalyzer:
         abnormal_tests_filtered = 0
 
         target_job_prefixes = [
-            "stage-a-test-1",
+            "stage-a-test-small-1-gpu",
             "unit-test-backend-1-gpu",
             "unit-test-backend-2-gpu",
             "stage-b-test-4-gpu-b200",
