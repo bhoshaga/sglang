@@ -425,8 +425,13 @@ def send_image_conditioned_request_sglang(
     task = case["task"]
     ref_bytes = _get_ref_image_bytes(config)
 
-    # Build multipart form
-    files = {"image": ("ref.png", io.BytesIO(ref_bytes), "image/png")}
+    # Build multipart form — field name depends on endpoint:
+    # image edits use "image", video (I2V/TI2V) uses "input_reference"
+    if task in ("image-to-video", "text-image-to-video"):
+        file_field = "input_reference"
+    else:
+        file_field = "image"
+    files = {file_field: ("ref.png", io.BytesIO(ref_bytes), "image/png")}
     data = {
         "model": case["model"],
         "prompt": case["prompt"],
