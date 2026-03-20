@@ -317,18 +317,24 @@ def generate_dashboard(
             s = _short_sha(run.get("commit_sha", ""))
             return f"{d} ({s})"
 
-        # Chart: SGLang latency trend per case
+        # Chart: SGLang latency trend per case (skip runs where value is N/A)
         for cid in case_ids:
             labels = []
             sg_vals = []
             vl_vals = []
             for run in all_runs:
                 run_cases = _extract_case_results(run)
-                labels.append(_chart_label(run))
                 sg = run_cases.get(cid, {}).get("sglang")
                 vl = run_cases.get(cid, {}).get("vllm-omni")
-                sg_vals.append(sg if sg else 0)
+                # Skip data points where SGLang has no data
+                if sg is None:
+                    continue
+                labels.append(_chart_label(run))
+                sg_vals.append(sg)
                 vl_vals.append(vl if vl else 0)
+
+            if not sg_vals:
+                continue  # skip chart if no valid data points
 
             has_vl_data = any(v > 0 for v in vl_vals)
 

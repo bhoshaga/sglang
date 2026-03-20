@@ -200,7 +200,7 @@ HEALTH_ENDPOINTS = {
 def wait_for_health(
     base_url: str, framework: str = "sglang", timeout: int = HEALTH_TIMEOUT
 ) -> None:
-    """Poll health endpoint until 200 or timeout."""
+    """Poll health endpoint until 200, then verify model is loaded."""
     endpoint = HEALTH_ENDPOINTS.get(framework, "/health")
     health_url = f"{base_url}{endpoint}"
     print(f"  Waiting for server at {health_url} ...")
@@ -209,9 +209,7 @@ def wait_for_health(
         try:
             resp = requests.get(health_url, timeout=2)
             if resp.status_code == 200:
-                elapsed = time.time() - start
-                print(f"  Server ready in {elapsed:.1f}s")
-                return
+                break
         except requests.exceptions.RequestException:
             pass
         if time.time() - start > timeout:
@@ -219,6 +217,26 @@ def wait_for_health(
                 f"Server at {health_url} did not start within {timeout}s"
             )
         time.sleep(2)
+
+    # For SGLang, /health can return 200 before model routes are registered.
+    # Poll /v1/models to confirm the model is fully loaded.
+    if framework == "sglang":
+        models_url = f"{base_url}/v1/models"
+        while True:
+            try:
+                resp = requests.get(models_url, timeout=5)
+                if resp.status_code == 200:
+                    break
+            except requests.exceptions.RequestException:
+                pass
+            if time.time() - start > timeout:
+                raise TimeoutError(
+                    f"Model at {models_url} not ready within {timeout}s"
+                )
+            time.sleep(2)
+
+    elapsed = time.time() - start
+    print(f"  Server ready in {elapsed:.1f}s")
 
 
 def kill_server(proc: subprocess.Popen) -> None:
