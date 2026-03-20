@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.hybrid_cache.hybrid_radix_cache import (
         HybridRadixCache,
         HybridTreeNode,
@@ -235,3 +236,36 @@ class TreeComponent(ABC):
         - Mamba: single-node unlock — only decrements lock_ref on the
           node itself."""
         ...
+
+    def prepare_for_caching_req(
+        self,
+        req: Req,
+        insert_params: InsertParams,
+        token_ids_len: int,
+        is_finished: bool,
+    ) -> Optional[int]:
+        """Prepare component-specific data before insert, fill component
+        fields in insert_params, return effective cache_len.
+        Return None for no truncation opinion (use full length);
+        return int >= 0 for effective cache length.
+        - Full: no-op, returns None.
+        - SWA: sets insert_params.swa_evicted_seqlen on finished; returns None.
+        - Mamba: prepares mamba_value (finished from ping-pong buffer,
+          unfinished fork from req); returns mamba_last_track_seqlen."""
+        return None
+
+    def cleanup_after_caching_req(
+        self,
+        req: Req,
+        insert_result: Optional[InsertResult],
+        insert_params: Optional[InsertParams],
+        is_finished: bool,
+    ) -> None:
+        """Post-cache cleanup for component-specific resources.
+        On disabled path, insert_result/insert_params are None.
+        - Full: no-op.
+        - SWA: no-op.
+        - Mamba: frees forked mamba_value based on mamba_exist,
+          frees mamba cache (handles ping-pong buffer keep_idx),
+          resets mamba_last_track_seqlen=None on unfinished."""
+        pass

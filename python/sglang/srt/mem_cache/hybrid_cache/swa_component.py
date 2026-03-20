@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.hybrid_cache.tree_component import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.hybrid_cache.hybrid_radix_cache import HybridTreeNode
 
 
@@ -235,3 +236,14 @@ class SWAComponent(TreeComponent):
             if swa_uuid_for_lock and comp.metadata.get("uuid") == swa_uuid_for_lock:
                 dec_swa = False
             cur = cur.parent
+
+    def prepare_for_caching_req(
+        self,
+        req: Req,
+        insert_params: InsertParams,
+        token_ids_len: int,
+        is_finished: bool,
+    ) -> Optional[int]:
+        if is_finished:
+            insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
+        return None

@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -42,6 +41,7 @@ from sglang.srt.mem_cache.radix_cache import (
     _key_match_paged,
     get_child_key,
     maybe_bigram_convert,
+    page_align_keys,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
@@ -246,18 +246,6 @@ class HybridRadixCache(BasePrefixCache):
             for component_name in self.component_names
         }
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
-        raise NotImplementedError(
-            "Generic HybridRadixCache requires a request lifecycle adapter. "
-            f"Configured components={self.component_order}."
-        )
-
-    def cache_unfinished_req(self, req: Req, chunked=False) -> None:
-        raise NotImplementedError(
-            "Generic HybridRadixCache requires a request lifecycle adapter. "
-            f"Configured components={self.component_order}."
-        )
-
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         key = params.key
         key, _ = maybe_bigram_convert(self.is_eagle, key)
@@ -323,6 +311,154 @@ class HybridRadixCache(BasePrefixCache):
         for component in self.components.values():
             component.release_component_lock(node, params)
         return DecLockRefResult()
+
+    def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
+        kv_committed_len = req.pop_committed_kv_cache()
+
+        if self.disable:
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :kv_committed_len
+            ]
+            self.token_to_kv_pool_allocator.free(kv_indices)
+            for comp in self.components.values():
+                comp.cleanup_after_caching_req(req, None, None, True)
+            return
+
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :kv_committed_len
+        ]
+
+        result = None
+        insert_params = None
+
+        if is_insert:
+            insert_params = InsertParams(prev_prefix_len=req.cache_protected_len)
+
+            # components prepare insert data + return effective cache_len
+            effective_cache_len = len(token_ids)
+            for comp in self.components.values():
+                cl = comp.prepare_for_caching_req(
+                    req, insert_params, len(token_ids), True
+                )
+                if cl is not None:
+                    effective_cache_len = min(effective_cache_len, cl)
+
+            # Truncate if needed
+            if effective_cache_len < len(token_ids):
+                free_start = max(effective_cache_len, req.cache_protected_len)
+                self.token_to_kv_pool_allocator.free(kv_indices[free_start:])
+                token_ids = token_ids[:effective_cache_len]
+                kv_indices = kv_indices[:effective_cache_len]
+
+            # Key convert + page align
+            keys = self.key_convert_fn(token_ids)
+            keys = page_align_keys(keys, self.page_size)
+            page_aligned_len = len(keys)
+            values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
+            radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
+
+            insert_params.key = radix_key
+            insert_params.value = values
+            result = self.insert(insert_params)
+
+            # Free unaligned tail
+            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+        else:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[req.cache_protected_len :]
+            )
+
+        self.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(
+                swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)
+            ),
+        )
+
+        # cleanup
+        for comp in self.components.values():
+            comp.cleanup_after_caching_req(req, result, insert_params, True)
+
+    def cache_unfinished_req(self, req: Req, chunked=False) -> None:
+        token_ids = req.fill_ids
+
+        if self.disable:
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : len(token_ids)
+            ]
+            req.prefix_indices = kv_indices
+            return
+
+        kv_indices_orig = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : len(token_ids)
+        ]
+
+        # components prepare insert data + return effective cache_len
+        insert_params = InsertParams(prev_prefix_len=req.cache_protected_len)
+        effective_cache_len = len(token_ids)
+        for comp in self.components.values():
+            cl = comp.prepare_for_caching_req(
+                req, insert_params, len(token_ids), False
+            )
+            if cl is not None:
+                effective_cache_len = min(effective_cache_len, cl)
+
+        if effective_cache_len <= 0:
+            req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
+            return
+
+        kv_indices = kv_indices_orig[:effective_cache_len]
+
+        # Key convert + page align
+        keys = self.key_convert_fn(token_ids[:effective_cache_len])
+        keys = page_align_keys(keys, self.page_size)
+        page_aligned_len = len(keys)
+        values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
+        radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
+
+        insert_params.key = radix_key
+        insert_params.value = values
+        result = self.insert(insert_params)
+
+        # Match prefix
+        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        new_indices = match_result.device_indices
+        new_last_node = match_result.last_device_node
+        new_prefix_len = result.prefix_len
+        assert (
+            req.cache_protected_len <= len(new_indices) + self.page_size - 1
+        ), f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+        assert new_prefix_len <= len(
+            new_indices
+        ), f"{new_prefix_len=}, {len(new_indices)=}"
+        self.req_to_token_pool.write(
+            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
+            new_indices[req.cache_protected_len :],
+        )
+
+        self.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(
+                swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)
+            ),
+        )
+        lock_result = self.inc_lock_ref(new_last_node)
+
+        # Update req fields
+        if len(new_indices) < len(kv_indices_orig):
+            req.prefix_indices = torch.cat(
+                [new_indices, kv_indices_orig[len(new_indices) :]]
+            )
+        else:
+            req.prefix_indices = new_indices
+        req.cache_protected_len = len(new_indices)
+        req.last_node = new_last_node
+        req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+
+        # cleanup
+        for comp in self.components.values():
+            comp.cleanup_after_caching_req(req, result, insert_params, False)
 
     ## Internal Helper Functions
     def _for_each_component_lru(self, node: HybridTreeNode, lru_op):
@@ -709,167 +845,16 @@ class HybridMambaRadixCache(HybridRadixCache):
             component_names=(ComponentName.MAMBA,),
         )
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
-        kv_committed_len = req.pop_committed_kv_cache()
-        if self.disable:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_committed_len
-            ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
-            self.req_to_token_pool.free_mamba_cache(req)
-            return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
-        ]
-        if is_insert:
-            cache_len = (
-                req.mamba_last_track_seqlen
-                if self.enable_mamba_extra_buffer
-                else len(token_ids)
-            )
-            if cache_len is None:
-                cache_len = 0
-            if cache_len != len(token_ids):
-                cache_end_idx = max(cache_len, req.cache_protected_len)
-                self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
-                token_ids = token_ids[:cache_len]
-                kv_indices = kv_indices[:cache_len]
-            if self.page_size != 1:
-                page_aligned_len = len(kv_indices) // self.page_size * self.page_size
-                page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
-                    dtype=torch.int64, copy=True
-                )
-            else:
-                page_aligned_len = len(kv_indices)
-                page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
-            assert cache_len == page_aligned_len, (
-                f"It is required {cache_len=}, {page_aligned_len=}, {kv_committed_len=}, "
-                f"{len(req.origin_input_ids)=}, {len(req.output_ids)=}"
-            )
-            if self.enable_mamba_extra_buffer:
-                keep_idx = self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
-                )
-                mamba_value = (
-                    req.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
-                )
-            else:
-                keep_idx = None
-                mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
-            result = self.insert(
-                InsertParams(
-                    key=RadixKey(token_ids[:page_aligned_len], req.extra_key),
-                    value=page_aligned_kv_indices,
-                    mamba_value=mamba_value,
-                    prev_prefix_len=req.cache_protected_len,
-                )
-            )
-            mamba_exist = result.mamba_exist
-        else:
-            self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
-            mamba_exist = True
-            keep_idx = None
-
-        if mamba_exist:
-            keep_idx = None
-        free_mamba_cache = True if self.enable_mamba_extra_buffer else mamba_exist
-        if free_mamba_cache:
-            self.req_to_token_pool.free_mamba_cache(
-                req, mamba_ping_pong_track_buffer_to_keep=keep_idx
-            )
-        self.dec_lock_ref(req.last_node)
-
-    def cache_unfinished_req(self, req: Req, chunked=False) -> None:
-        def _skip(req: Req):
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : len(req.fill_ids)
-            ]
-            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
-
-        token_ids = req.fill_ids
-        cache_len = (
-            req.mamba_last_track_seqlen
-            if self.enable_mamba_extra_buffer
-            else len(token_ids)
-        )
-        if self.disable or cache_len is None:
-            return _skip(req)
-        kv_indices_orig = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
-        ]
-        kv_indices = kv_indices_orig[:cache_len]
-        if self.page_size != 1:
-            page_aligned_len = len(kv_indices) // self.page_size * self.page_size
-            page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
-                dtype=torch.int64, copy=True
-            )
-        else:
-            page_aligned_len = len(kv_indices)
-            page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
-        assert page_aligned_len == len(kv_indices), (
-            f"page_aligned_len != len(kv_indices), {page_aligned_len=}, "
-            f"{len(kv_indices)=}, {cache_len=}, {self.page_size=}, {FLA_CHUNK_SIZE=}"
-        )
-        page_aligned_token_ids = token_ids[:page_aligned_len]
-        if self.enable_mamba_extra_buffer:
-            keep_idx = self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                req.mamba_next_track_idx
-            )
-            mamba_value = (
-                req.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
-            )
-        else:
-            mamba_value = self.req_to_token_pool.get_mamba_indices(
-                req.req_pool_idx
-            ).unsqueeze(-1)
-        mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
-        if mamba_value_forked is None:
-            self.evict(EvictParams(num_tokens=0, mamba_num=1))
-            mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(
-                mamba_value
-            )
-            assert mamba_value_forked is not None, "Can not alloc mamba cache"
-        result = self.insert(
-            InsertParams(
-                key=RadixKey(page_aligned_token_ids, req.extra_key),
-                value=page_aligned_kv_indices,
-                mamba_value=mamba_value_forked,
-                prev_prefix_len=req.cache_protected_len,
-            )
-        )
-        if result.mamba_exist:
-            self.req_to_token_pool.mamba_pool.free(mamba_value_forked)
-        match_result = self.match_prefix(
-            MatchPrefixParams(key=RadixKey(page_aligned_token_ids, req.extra_key))
-        )
-        new_indices = match_result.device_indices
-        new_last_node = match_result.last_device_node
-        self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
-            new_indices[req.cache_protected_len :],
-        )
-        self.dec_lock_ref(req.last_node)
-        self.inc_lock_ref(new_last_node)
-        req.prefix_indices = torch.cat(
-            [new_indices, kv_indices_orig[len(new_indices) :]]
-        )
-        req.cache_protected_len = len(new_indices)
-        req.mamba_last_track_seqlen = None
-        req.last_node = new_last_node
-
-
-# TODO: Support SWA Radix Tree
 class HybridSWARadixCache(HybridRadixCache):
     def __init__(self, params: CacheInitParams):
-        raise NotImplementedError
-
-    def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
-        raise NotImplementedError
-
-    def cache_unfinished_req(self, req: Req, chunked=False) -> None:
-        raise NotImplementedError
+        assert isinstance(
+            params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+        )
+        super().__init__(
+            params,
+            component_names=(ComponentName.SWA,),
+        )
 
 
 def create_hybrid_radix_cache(

@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.hybrid_cache.tree_component import (
 from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.hybrid_cache.hybrid_radix_cache import HybridTreeNode
 
 
@@ -169,3 +170,90 @@ class MambaComponent(TreeComponent):
                 self.cache.component_evictable_size_[self.name] += len(value)
                 self.cache.component_protected_size_[self.name] -= len(value)
             node.component(self.name).lock_ref -= 1
+
+    def prepare_for_caching_req(
+        self,
+        req: Req,
+        insert_params: InsertParams,
+        token_ids_len: int,
+        is_finished: bool,
+    ) -> Optional[int]:
+        cache_len = (
+            req.mamba_last_track_seqlen
+            if self.cache.enable_mamba_extra_buffer
+            else token_ids_len
+        )
+        if is_finished:
+            if cache_len is None:
+                cache_len = 0
+            if self.cache.enable_mamba_extra_buffer:
+                keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                    req.mamba_next_track_idx
+                )
+                mamba_value = (
+                    req.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
+                )
+            else:
+                mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
+            insert_params.mamba_value = mamba_value
+            return cache_len
+        else:
+            if cache_len is None:
+                return 0
+            if self.cache.enable_mamba_extra_buffer:
+                keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                    req.mamba_next_track_idx
+                )
+                mamba_value = (
+                    req.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
+                )
+            else:
+                mamba_value = self.cache.req_to_token_pool.get_mamba_indices(
+                    req.req_pool_idx
+                ).unsqueeze(-1)
+            mamba_value_forked = self.cache.req_to_token_pool.mamba_pool.fork_from(
+                mamba_value
+            )
+            if mamba_value_forked is None:
+                self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+                mamba_value_forked = (
+                    self.cache.req_to_token_pool.mamba_pool.fork_from(mamba_value)
+                )
+                assert mamba_value_forked is not None, "Can not alloc mamba cache"
+            insert_params.mamba_value = mamba_value_forked
+            return cache_len
+
+    def cleanup_after_caching_req(
+        self,
+        req: Req,
+        insert_result: Optional[InsertResult],
+        insert_params: Optional[InsertParams],
+        is_finished: bool,
+    ) -> None:
+        if is_finished:
+            mamba_exist = (
+                insert_result.mamba_exist if insert_result is not None else True
+            )
+            if self.cache.enable_mamba_extra_buffer:
+                keep_idx = (
+                    self.cache.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                        req.mamba_next_track_idx
+                    )
+                )
+            else:
+                keep_idx = None
+            if mamba_exist:
+                keep_idx = None
+            free_mamba_cache = (
+                True if self.cache.enable_mamba_extra_buffer else mamba_exist
+            )
+            if free_mamba_cache:
+                self.cache.req_to_token_pool.free_mamba_cache(
+                    req, mamba_ping_pong_track_buffer_to_keep=keep_idx
+                )
+        else:
+            if insert_result is not None and insert_result.mamba_exist:
+                self.cache.req_to_token_pool.mamba_pool.free(
+                    insert_params.mamba_value
+                )
+            req.mamba_last_track_seqlen = None
