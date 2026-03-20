@@ -151,25 +151,6 @@
           "extra_env": {}
         }
       }
-    },
-    {
-      "id": "hunyuanvideo_t2v_480p",
-      "model": "hunyuanvideo-community/HunyuanVideo",
-      "task": "text-to-video",
-      "prompt": "A cat and a dog baking a cake together in a kitchen.",
-      "width": 848,
-      "height": 480,
-      "num_frames": 65,
-      "num_inference_steps": 30,
-      "guidance_scale": 6.0,
-      "seed": 42,
-      "num_gpus": 1,
-      "frameworks": {
-        "sglang": {
-          "serve_args": "--enable-torch-compile --warmup",
-          "extra_env": {}
-        }
-      }
     }
   ]
 }
