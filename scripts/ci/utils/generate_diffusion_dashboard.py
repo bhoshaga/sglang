@@ -455,9 +455,7 @@ def generate_dashboard(
                 lines.append(f"![Speedup Trend](data:image/png;base64,{b64})\n")
 
         except ImportError:
-            lines.append(
-                "\n*Charts unavailable (matplotlib not installed)*\n"
-            )
+            lines.append("\n*Charts unavailable (matplotlib not installed)*\n")
 
     # Footer
     lines.append("\n---")
