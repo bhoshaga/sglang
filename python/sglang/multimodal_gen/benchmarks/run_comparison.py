@@ -38,7 +38,11 @@ import requests
 # ---------------------------------------------------------------------------
 CONFIGS_PATH = Path(__file__).parent / "comparison_configs.json"
 INSTALL_SCRIPT = (
-    Path(__file__).parents[4] / "scripts" / "ci" / "install_comparison_frameworks.sh"
+    Path(__file__).parents[4]
+    / "scripts"
+    / "ci"
+    / "utils"
+    / "install_comparison_frameworks.sh"
 )
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 30000

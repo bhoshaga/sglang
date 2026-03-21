@@ -567,7 +567,6 @@ def fuse_layernorm_scale_shift_gate_select01_kernel(
     return output, gate_out
 
 
-@torch.compiler.disable
 def fuse_residual_layernorm_scale_shift_gate_select01_kernel(
     x: torch.Tensor,
     residual: torch.Tensor,

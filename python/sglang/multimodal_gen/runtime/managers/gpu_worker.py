@@ -298,7 +298,7 @@ class GPUWorker:
                 if not req.is_warmup:
                     PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
 
-            # Dump per-request perf report to specified file (server mode)
+            # dump per-request perf report to specified file (server mode)
             if (
                 req.perf_dump_path is not None
                 and not req.is_warmup

@@ -643,7 +643,7 @@ jobs:
         env:
           GH_PAT_FOR_NIGHTLY_CI_DATA: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
-          python3 scripts/ci/generate_diffusion_dashboard.py \
+          python3 scripts/ci/utils/generate_diffusion_dashboard.py \
             --results comparison-results.json \
             --output dashboard.md \
             --fetch-history \
@@ -654,7 +654,7 @@ jobs:
         env:
           GH_PAT_FOR_NIGHTLY_CI_DATA: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
-          python3 scripts/ci/publish_comparison_results.py \
+          python3 scripts/ci/utils/publish_comparison_results.py \
             --results comparison-results.json \
             --dashboard dashboard.md
 

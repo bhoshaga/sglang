@@ -4,7 +4,7 @@ Pushes comparison-results.json and dashboard.md to the ci-data repository
 for historical tracking.
 
 Usage:
-    python3 scripts/ci/publish_comparison_results.py \
+    python3 scripts/ci/utils/publish_comparison_results.py \
         --results comparison-results.json \
         --dashboard dashboard.md
 """
