@@ -239,8 +239,11 @@ def wait_for_health(
     print(f"  Server ready in {elapsed:.1f}s")
 
 
+KILLALL_SCRIPT = Path(__file__).parents[4] / "scripts" / "killall_sglang.sh"
+
+
 def kill_server(proc: subprocess.Popen) -> None:
-    """Kill server process tree."""
+    """Kill server process tree and clean up GPU processes."""
     if proc.poll() is not None:
         return
     try:
@@ -255,6 +258,13 @@ def kill_server(proc: subprocess.Popen) -> None:
         except (ProcessLookupError, PermissionError):
             pass
         proc.wait(timeout=10)
+    # Use killall_sglang.sh for thorough cleanup (esp. multi-GPU workers)
+    if KILLALL_SCRIPT.exists():
+        subprocess.run(
+            ["bash", str(KILLALL_SCRIPT)],
+            timeout=30,
+            capture_output=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -712,12 +722,15 @@ def run_single(
         wait_for_health(base_url, framework)
 
         # Warmup requests (not measured, no perf dump)
-        # Send 2 warmup requests to ensure all torch.compile/triton kernel
-        # specializations are covered before the measured request.
+        # Use few steps to be fast — server's own warmup (warmup_steps=3) handles
+        # torch.compile compilation; these external warmups just stabilize triton
+        # kernel specializations across requests.
+        WARMUP_STEPS = 3
+        warmup_case = {**case, "num_inference_steps": WARMUP_STEPS}
         for wi in range(1, 3):
-            print(f"  Sending warmup request ({wi}/2)...")
+            print(f"  Sending warmup request ({wi}/2, {WARMUP_STEPS} steps)...")
             try:
-                send_request(base_url, case, framework, config)
+                send_request(base_url, warmup_case, framework, config)
             except Exception as e:
                 print(f"  Warmup request {wi} failed (non-fatal): {e}")
 
