@@ -12,6 +12,8 @@ Usage:
 """
 
 import argparse
+import base64
+import io
 import json
 import os
 import sys
@@ -307,83 +309,155 @@ def generate_dashboard(
                 row += f" {_fmt_speedup(sg, vl)} |"
             lines.append(row)
 
-    # ---- Section 4: Mermaid Trend Charts ----
+    # ---- Section 4: Matplotlib Trend Charts (embedded as base64 PNG) ----
     if history:
         all_runs = list(reversed([current] + history))  # chronological order
 
-        # Build x-axis labels: "Mar 17 (abc1234)"
         def _chart_label(run: dict) -> str:
             d = _short_date(run.get("timestamp", ""))
             s = _short_sha(run.get("commit_sha", ""))
-            return f"{d} ({s})"
+            return f"{d}\n({s})"
 
-        # Chart: SGLang latency trend per case (skip runs where value is N/A)
-        for cid in case_ids:
-            labels = []
-            sg_vals = []
-            vl_vals = []
-            for run in all_runs:
-                run_cases = _extract_case_results(run)
-                sg = run_cases.get(cid, {}).get("sglang")
-                vl = run_cases.get(cid, {}).get("vllm-omni")
-                # Skip data points where SGLang has no data
-                if sg is None:
-                    continue
-                labels.append(_chart_label(run))
-                sg_vals.append(sg)
-                vl_vals.append(vl if vl else 0)
+        def _fig_to_base64(fig) -> str:
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+            buf.seek(0)
+            return base64.b64encode(buf.read()).decode("utf-8")
 
-            if not sg_vals:
-                continue  # skip chart if no valid data points
+        try:
+            import matplotlib
 
-            has_vl_data = any(v > 0 for v in vl_vals)
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
 
-            lines.append(f"\n### Latency Trend: {cid}\n")
-            lines.append("```mermaid")
-            lines.append("xychart-beta")
-            lines.append(f'  title "Latency Trend — {cid}"')
-            lines.append("  x-axis [{}]".format(", ".join(f'"{l}"' for l in labels)))
-            all_vals = sg_vals + (vl_vals if has_vl_data else [])
-            max_val = max(all_vals) * 1.2 if all_vals else 100
-            lines.append(f'  y-axis "Latency (s)" 0 --> {max_val:.0f}')
-            lines.append(f"  line [{', '.join(f'{v:.2f}' for v in sg_vals)}]")
-            if has_vl_data:
-                lines.append(f"  line [{', '.join(f'{v:.2f}' for v in vl_vals)}]")
-            lines.append("```")
-            if has_vl_data:
-                lines.append(f"\n*Blue: SGLang, Orange: vLLM-Omni*\n")
-            else:
-                lines.append(f"\n*SGLang performance over time*\n")
-
-        # Chart: Speedup trend (only if multiple frameworks)
-        if other_frameworks:
-            lines.append("\n### Speedup Trend (SGLang vs vLLM-Omni)\n")
-            lines.append("```mermaid")
-            lines.append("xychart-beta")
-            lines.append('  title "SGLang Speedup Over vLLM-Omni"')
-            chart_labels = [_chart_label(run) for run in all_runs]
-            lines.append(
-                "  x-axis [{}]".format(", ".join(f'"{l}"' for l in chart_labels))
-            )
-            lines.append('  y-axis "Speedup (x)" 0 --> 3')
-
+            # Per-case latency trend charts
             for cid in case_ids:
-                speedups = []
+                labels = []
+                sg_vals = []
+                vl_vals = []
                 for run in all_runs:
                     run_cases = _extract_case_results(run)
                     sg = run_cases.get(cid, {}).get("sglang")
                     vl = run_cases.get(cid, {}).get("vllm-omni")
-                    if sg and vl and sg > 0:
-                        speedups.append(vl / sg)
-                    else:
-                        speedups.append(1.0)
-                lines.append(f"  line [{', '.join(f'{v:.2f}' for v in speedups)}]")
+                    if sg is None:
+                        continue
+                    labels.append(_chart_label(run))
+                    sg_vals.append(sg)
+                    vl_vals.append(vl)
 
-            lines.append("```")
-            case_legend = ", ".join(
-                f"*Line {i+1}: {cid}*" for i, cid in enumerate(case_ids)
+                if not sg_vals:
+                    continue
+
+                has_vl = any(v is not None for v in vl_vals)
+                fig, ax = plt.subplots(figsize=(max(6, len(labels) * 1.2), 4))
+
+                # SGLang line
+                ax.plot(
+                    range(len(sg_vals)),
+                    sg_vals,
+                    "o-",
+                    color="#2563eb",
+                    linewidth=2,
+                    markersize=6,
+                    label="SGLang",
+                )
+                for i, v in enumerate(sg_vals):
+                    ax.annotate(
+                        f"{v:.2f}s",
+                        (i, v),
+                        textcoords="offset points",
+                        xytext=(0, 10),
+                        ha="center",
+                        fontsize=8,
+                        fontweight="bold",
+                        color="#2563eb",
+                    )
+
+                # vLLM-Omni line (if data exists)
+                if has_vl:
+                    vl_clean = [v if v is not None else float("nan") for v in vl_vals]
+                    ax.plot(
+                        range(len(vl_clean)),
+                        vl_clean,
+                        "s--",
+                        color="#dc2626",
+                        linewidth=2,
+                        markersize=5,
+                        label="vLLM-Omni",
+                    )
+                    for i, v in enumerate(vl_vals):
+                        if v is not None:
+                            ax.annotate(
+                                f"{v:.2f}s",
+                                (i, v),
+                                textcoords="offset points",
+                                xytext=(0, -14),
+                                ha="center",
+                                fontsize=8,
+                                color="#dc2626",
+                            )
+
+                ax.set_xticks(range(len(labels)))
+                ax.set_xticklabels(labels, fontsize=7)
+                ax.set_ylabel("Latency (s)")
+                ax.set_title(f"Latency Trend — {cid}", fontsize=11, fontweight="bold")
+                ax.legend(loc="upper right", fontsize=8)
+                ax.grid(True, alpha=0.3)
+                ax.set_ylim(bottom=0)
+
+                b64 = _fig_to_base64(fig)
+                plt.close(fig)
+
+                lines.append(f"\n### Latency Trend: {cid}\n")
+                lines.append(f"![Latency Trend {cid}](data:image/png;base64,{b64})\n")
+
+            # Speedup trend chart (only if multiple frameworks)
+            if other_frameworks:
+                fig, ax = plt.subplots(figsize=(max(6, len(all_runs) * 1.2), 4))
+                colors = ["#2563eb", "#dc2626", "#16a34a", "#ea580c"]
+                for ci, cid in enumerate(case_ids):
+                    speedups = []
+                    run_labels = []
+                    for run in all_runs:
+                        run_cases = _extract_case_results(run)
+                        sg = run_cases.get(cid, {}).get("sglang")
+                        vl = run_cases.get(cid, {}).get("vllm-omni")
+                        if sg and vl and sg > 0:
+                            speedups.append(vl / sg)
+                        else:
+                            speedups.append(None)
+                        run_labels.append(_chart_label(run))
+                    clean = [v if v is not None else float("nan") for v in speedups]
+                    ax.plot(
+                        range(len(clean)),
+                        clean,
+                        "o-",
+                        color=colors[ci % len(colors)],
+                        linewidth=2,
+                        markersize=5,
+                        label=cid,
+                    )
+
+                ax.set_xticks(range(len(run_labels)))
+                ax.set_xticklabels(run_labels, fontsize=7)
+                ax.set_ylabel("Speedup (x)")
+                ax.set_title(
+                    "SGLang Speedup Over vLLM-Omni", fontsize=11, fontweight="bold"
+                )
+                ax.axhline(y=1.0, color="gray", linestyle=":", alpha=0.5)
+                ax.legend(loc="upper left", fontsize=7)
+                ax.grid(True, alpha=0.3)
+
+                b64 = _fig_to_base64(fig)
+                plt.close(fig)
+
+                lines.append("\n### Speedup Trend (SGLang vs vLLM-Omni)\n")
+                lines.append(f"![Speedup Trend](data:image/png;base64,{b64})\n")
+
+        except ImportError:
+            lines.append(
+                "\n*Charts unavailable (matplotlib not installed)*\n"
             )
-            lines.append(f"\n{case_legend}\n")
 
     # Footer
     lines.append("\n---")
