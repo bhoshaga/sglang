@@ -646,6 +646,7 @@ jobs:
           python3 scripts/ci/utils/generate_diffusion_dashboard.py \
             --results comparison-results.json \
             --output dashboard.md \
+            --charts-dir comparison-charts \
             --fetch-history \
             --step-summary
 
@@ -656,7 +657,8 @@ jobs:
         run: |
           python3 scripts/ci/utils/publish_comparison_results.py \
             --results comparison-results.json \
-            --dashboard dashboard.md
+            --dashboard dashboard.md \
+            --charts-dir comparison-charts
 
       - name: Upload comparison artifacts
         if: always()
@@ -666,6 +668,7 @@ jobs:
           path: |
             comparison-results.json
             dashboard.md
+            comparison-charts/
             comparison-logs/
           retention-days: 90
           if-no-files-found: ignore
