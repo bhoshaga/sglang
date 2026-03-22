@@ -1,19 +1,18 @@
 """Generate a Markdown dashboard for diffusion cross-framework comparisons.
 
 Reads current comparison results + historical data from sglang-ci-data repo
-and produces a Markdown report with tables and Mermaid trend charts.
+and produces a Markdown report with tables and trend charts saved as PNG files.
 
 Usage:
     python3 scripts/ci/utils/generate_diffusion_dashboard.py \
         --results comparison-results.json \
         --output dashboard.md \
+        --charts-dir comparison-charts/ \
         --history-dir history/           # optional, local history JSONs
         --fetch-history                  # fetch from GitHub API instead
 """
 
 import argparse
-import base64
-import io
 import json
 import os
 import sys
@@ -28,6 +27,12 @@ CI_DATA_REPO_NAME = "sglang-ci-data"
 CI_DATA_BRANCH = "main"
 HISTORY_PREFIX = "diffusion-comparisons"
 MAX_HISTORY_RUNS = 7
+
+# Base URL for chart images pushed to sglang-ci-data
+CHARTS_RAW_BASE_URL = (
+    f"https://raw.githubusercontent.com/{CI_DATA_REPO_OWNER}/{CI_DATA_REPO_NAME}"
+    f"/{CI_DATA_BRANCH}/{HISTORY_PREFIX}/charts"
+)
 
 
 def _github_get(url: str, token: str) -> dict | list | None:
@@ -155,11 +160,24 @@ def _extract_case_results(run_data: dict) -> dict[str, dict[str, float | None]]:
     return mapping
 
 
+def _sanitize_filename(name: str) -> str:
+    """Sanitize a case ID to be a safe filename."""
+    return name.replace("/", "_").replace(" ", "_").replace(":", "_")
+
+
 def generate_dashboard(
     current: dict,
     history: list[dict],
+    charts_dir: str | None = None,
 ) -> str:
-    """Generate full markdown dashboard."""
+    """Generate full markdown dashboard.
+
+    If charts_dir is provided, saves chart PNGs as files to that directory
+    and references them via raw.githubusercontent URLs. Otherwise, charts
+    are omitted.
+
+    Returns the markdown string.
+    """
     lines: list[str] = []
     lines.append("# Diffusion Cross-Framework Performance Dashboard\n")
     ts = current.get("timestamp", datetime.now(timezone.utc).isoformat())
@@ -233,7 +251,7 @@ def generate_dashboard(
         sg_lat = case_fws.get("sglang")
 
         row = f"| {r['model'].split('/')[-1]} |"
-        # Latency columns — bold the fastest
+        # Latency columns -- bold the fastest
         lats = {fw: case_fws.get(fw) for fw in all_frameworks}
         valid_lats = [v for v in lats.values() if v is not None]
         min_lat = min(valid_lats) if valid_lats else None
@@ -283,7 +301,7 @@ def generate_dashboard(
                     emojis.append(_trend_emoji(cur, prev))
                 row += " ".join(emojis) + " |"
             else:
-                row += " — |"
+                row += " -- |"
             lines.append(row)
 
     # ---- Section 3: Cross-Framework Speedup Trend (only if multiple frameworks) ----
@@ -309,8 +327,8 @@ def generate_dashboard(
                 row += f" {_fmt_speedup(sg, vl)} |"
             lines.append(row)
 
-    # ---- Section 4: Matplotlib Trend Charts (embedded as base64 PNG) ----
-    if history:
+    # ---- Section 4: Matplotlib Trend Charts (saved as PNG files) ----
+    if history and charts_dir:
         all_runs = list(reversed([current] + history))  # chronological order
 
         def _chart_label(run: dict) -> str:
@@ -318,17 +336,13 @@ def generate_dashboard(
             s = _short_sha(run.get("commit_sha", ""))
             return f"{d}\n({s})"
 
-        def _fig_to_base64(fig) -> str:
-            buf = io.BytesIO()
-            fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
-            buf.seek(0)
-            return base64.b64encode(buf.read()).decode("utf-8")
-
         try:
             import matplotlib
 
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
+
+            os.makedirs(charts_dir, exist_ok=True)
 
             # Per-case latency trend charts
             for cid in case_ids:
@@ -400,22 +414,26 @@ def generate_dashboard(
                 ax.set_xticks(range(len(labels)))
                 ax.set_xticklabels(labels, fontsize=7)
                 ax.set_ylabel("Latency (s)")
-                ax.set_title(f"Latency Trend — {cid}", fontsize=11, fontweight="bold")
+                ax.set_title(f"Latency Trend -- {cid}", fontsize=11, fontweight="bold")
                 ax.legend(loc="upper right", fontsize=8)
                 ax.grid(True, alpha=0.3)
                 ax.set_ylim(bottom=0)
 
-                b64 = _fig_to_base64(fig)
+                filename = f"latency_{_sanitize_filename(cid)}.png"
+                chart_path = os.path.join(charts_dir, filename)
+                fig.savefig(chart_path, format="png", dpi=120, bbox_inches="tight")
                 plt.close(fig)
+                print(f"  Saved chart: {chart_path}")
 
+                chart_url = f"{CHARTS_RAW_BASE_URL}/{filename}"
                 lines.append(f"\n### Latency Trend: {cid}\n")
-                lines.append(f"![Latency Trend {cid}](data:image/png;base64,{b64})\n")
+                lines.append(f"![Latency Trend {cid}]({chart_url})\n")
 
             # Speedup trend chart (only if multiple frameworks)
             if other_frameworks:
                 fig, ax = plt.subplots(figsize=(max(6, len(all_runs) * 1.2), 4))
                 colors = ["#2563eb", "#dc2626", "#16a34a", "#ea580c"]
-                for ci, cid in enumerate(case_ids):
+                for ci_idx, cid in enumerate(case_ids):
                     speedups = []
                     run_labels = []
                     for run in all_runs:
@@ -432,7 +450,7 @@ def generate_dashboard(
                         range(len(clean)),
                         clean,
                         "o-",
-                        color=colors[ci % len(colors)],
+                        color=colors[ci_idx % len(colors)],
                         linewidth=2,
                         markersize=5,
                         label=cid,
@@ -448,11 +466,15 @@ def generate_dashboard(
                 ax.legend(loc="upper left", fontsize=7)
                 ax.grid(True, alpha=0.3)
 
-                b64 = _fig_to_base64(fig)
+                filename = "speedup_trend.png"
+                chart_path = os.path.join(charts_dir, filename)
+                fig.savefig(chart_path, format="png", dpi=120, bbox_inches="tight")
                 plt.close(fig)
+                print(f"  Saved chart: {chart_path}")
 
+                chart_url = f"{CHARTS_RAW_BASE_URL}/{filename}"
                 lines.append("\n### Speedup Trend (SGLang vs vLLM-Omni)\n")
-                lines.append(f"![Speedup Trend](data:image/png;base64,{b64})\n")
+                lines.append(f"![Speedup Trend]({chart_url})\n")
 
         except ImportError:
             lines.append("\n*Charts unavailable (matplotlib not installed)*\n")
@@ -484,6 +506,11 @@ def main():
         "--output",
         default="dashboard.md",
         help="Output markdown file path",
+    )
+    parser.add_argument(
+        "--charts-dir",
+        default="comparison-charts",
+        help="Directory to save chart PNG files (default: comparison-charts/)",
     )
     parser.add_argument(
         "--history-dir",
@@ -523,7 +550,7 @@ def main():
         print(f"Loaded {len(history)} historical run(s) from {args.history_dir}")
 
     # Generate dashboard
-    markdown = generate_dashboard(current, history)
+    markdown = generate_dashboard(current, history, charts_dir=args.charts_dir)
 
     # Write output
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)

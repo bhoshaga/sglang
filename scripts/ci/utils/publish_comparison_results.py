@@ -1,12 +1,16 @@
 """Publish diffusion comparison results to sglang-bot/sglang-ci-data repo.
 
-Pushes comparison-results.json and dashboard.md to the ci-data repository
-for historical tracking.
+Pushes comparison-results.json, dashboard.md, and chart PNG files to the
+ci-data repository for historical tracking. Chart PNGs are stored under
+diffusion-comparisons/charts/ so they can be referenced via
+raw.githubusercontent URLs in the dashboard markdown (GitHub Step Summary
+blocks data: URIs).
 
 Usage:
     python3 scripts/ci/utils/publish_comparison_results.py \
         --results comparison-results.json \
-        --dashboard dashboard.md
+        --dashboard dashboard.md \
+        --charts-dir comparison-charts/
 """
 
 import argparse
@@ -37,11 +41,33 @@ BRANCH = "main"
 STORAGE_PREFIX = "diffusion-comparisons"
 
 
+def _collect_chart_files(charts_dir: str) -> list[tuple[str, bytes]]:
+    """Collect PNG chart files from directory for upload."""
+    files: list[tuple[str, bytes]] = []
+    if not charts_dir or not os.path.isdir(charts_dir):
+        return files
+
+    for entry in sorted(os.listdir(charts_dir)):
+        if not entry.lower().endswith(".png"):
+            continue
+        full_path = os.path.join(charts_dir, entry)
+        if not os.path.isfile(full_path):
+            continue
+        with open(full_path, "rb") as f:
+            content = f.read()
+        # Store charts under diffusion-comparisons/charts/
+        repo_path = f"{STORAGE_PREFIX}/charts/{entry}"
+        files.append((repo_path, content))
+
+    return files
+
+
 def publish_comparison(
     results_path: str,
     dashboard_path: str | None = None,
+    charts_dir: str | None = None,
 ) -> None:
-    """Publish comparison results and dashboard to ci-data repo."""
+    """Publish comparison results, dashboard, and charts to ci-data repo."""
     token = os.environ.get("GH_PAT_FOR_NIGHTLY_CI_DATA") or os.environ.get(
         "GITHUB_TOKEN"
     )
@@ -75,6 +101,12 @@ def publish_comparison(
         dashboard_target = f"{STORAGE_PREFIX}/dashboard.md"
         with open(dashboard_path, "rb") as f:
             files_to_upload.append((dashboard_target, f.read()))
+
+    # Chart PNG files
+    chart_files = _collect_chart_files(charts_dir)
+    if chart_files:
+        print(f"Found {len(chart_files)} chart PNG(s) to upload")
+        files_to_upload.extend(chart_files)
 
     print(f"Publishing {len(files_to_upload)} file(s) to {REPO_OWNER}/{REPO_NAME}")
 
@@ -162,6 +194,11 @@ def main():
         default=None,
         help="Path to dashboard.md (optional)",
     )
+    parser.add_argument(
+        "--charts-dir",
+        default=None,
+        help="Directory containing chart PNG files to upload (optional)",
+    )
 
     args = parser.parse_args()
 
@@ -172,6 +209,7 @@ def main():
     publish_comparison(
         results_path=args.results,
         dashboard_path=args.dashboard,
+        charts_dir=args.charts_dir,
     )
 
 
