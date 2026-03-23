@@ -163,7 +163,7 @@ class ServerArgs:
     # warmup
     warmup: bool = False
     warmup_resolutions: list[str] = None
-    warmup_steps: int = 3
+    warmup_steps: int = 1
 
     disable_autocast: bool | None = None
 
