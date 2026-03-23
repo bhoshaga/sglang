@@ -137,6 +137,76 @@ def _short_sha(sha: str) -> str:
     return sha[:7] if sha and sha != "unknown" else "?"
 
 
+def _assess_risk(
+    cid: str,
+    current_cases: dict[str, dict[str, float | None]],
+    history: list[dict],
+    other_frameworks: list[str],
+) -> tuple[str, str]:
+    """Assess risk for a given case, returning (emoji, reason).
+
+    Rules (checked in order):
+    - N/A latency → ❌ broken
+    - History exists: SGLang latency >5% vs avg of last 3 runs → ⚠️ regression
+    - Competitor exists & SGLang slower → 🔴 competitive risk
+    - SGLang faster than all competitors by >20% → 🟢 strong advantage
+    - SGLang faster than all competitors by ≤20% → 🟡 moderate advantage
+    - Default → ✅ stable
+    """
+    sg_lat = current_cases.get(cid, {}).get("sglang")
+
+    # Broken: sglang latency is N/A
+    if sg_lat is None:
+        return "❌", f"{cid}: SGLang latency is N/A (broken)"
+
+    # Check regression against 3-run historical average
+    if history:
+        hist_lats: list[float] = []
+        for run in history[:3]:
+            run_cases = _extract_case_results(run)
+            h_lat = run_cases.get(cid, {}).get("sglang")
+            if h_lat is not None:
+                hist_lats.append(h_lat)
+        if hist_lats:
+            avg_3 = sum(hist_lats) / len(hist_lats)
+            if avg_3 > 0 and (sg_lat - avg_3) / avg_3 > 0.05:
+                pct = (sg_lat - avg_3) / avg_3 * 100
+                return (
+                    "⚠️",
+                    f"{cid}: SGLang regression +{pct:.1f}% vs 3-run avg "
+                    f"({sg_lat:.2f}s vs {avg_3:.2f}s)",
+                )
+
+    # Check competitive risk
+    if other_frameworks:
+        competitor_lats: dict[str, float] = {}
+        for ofw in other_frameworks:
+            olat = current_cases.get(cid, {}).get(ofw)
+            if olat is not None:
+                competitor_lats[ofw] = olat
+
+        if competitor_lats:
+            # SGLang slower than any competitor?
+            for ofw, olat in competitor_lats.items():
+                if sg_lat > olat:
+                    return (
+                        "🔴",
+                        f"{cid}: SGLang slower than {ofw} "
+                        f"({sg_lat:.2f}s vs {olat:.2f}s)",
+                    )
+
+            # SGLang faster — check margin
+            min_competitor = min(competitor_lats.values())
+            advantage = (min_competitor - sg_lat) / min_competitor
+            if advantage > 0.20:
+                return "🟢", ""
+            else:
+                return "🟡", ""
+
+    # Default: stable
+    return "✅", ""
+
+
 def _trend_emoji(current: float | None, previous: float | None) -> str:
     if current is None or previous is None:
         return ""
@@ -227,9 +297,14 @@ def generate_dashboard(
     # ---- Section 1: Cross-Framework Comparison (current run) ----
     lines.append("## Cross-Framework Performance Comparison\n")
 
+    # Compute risk assessments for all cases
+    risk_map: dict[str, tuple[str, str]] = {}
+    for cid in case_ids:
+        risk_map[cid] = _assess_risk(cid, current_cases, history, other_frameworks)
+
     # Dynamic header
-    header = "| Model |"
-    sep = "|-------|"
+    header = "| Model | Risk |"
+    sep = "|-------|------|"
     for fw in all_frameworks:
         header += f" {fw} (s) |"
         sep += "---------|"
@@ -250,7 +325,8 @@ def generate_dashboard(
         case_fws = current_cases.get(cid, {})
         sg_lat = case_fws.get("sglang")
 
-        row = f"| {r['model'].split('/')[-1]} |"
+        risk_emoji, _ = risk_map.get(cid, ("✅", ""))
+        row = f"| {r['model'].split('/')[-1]} | {risk_emoji} |"
         # Latency columns -- bold the fastest
         lats = {fw: case_fws.get(fw) for fw in all_frameworks}
         valid_lats = [v for v in lats.values() if v is not None]
@@ -478,6 +554,22 @@ def generate_dashboard(
 
         except ImportError:
             lines.append("\n*Charts unavailable (matplotlib not installed)*\n")
+
+    # ---- Risk Notification ----
+    alert_cases = [
+        (cid, emoji, reason)
+        for cid, (emoji, reason) in risk_map.items()
+        if emoji in ("⚠️", "🔴", "❌")
+    ]
+    if alert_cases:
+        lines.append("\n> [!CAUTION]")
+        lines.append("> **Action Required — Performance Alert**")
+        lines.append(">")
+        lines.append("> The following cases need attention:")
+        for _cid, _emoji, reason in alert_cases:
+            lines.append(f"> - {reason}")
+        lines.append(">")
+        lines.append("> cc @mickqian @bbuf @yhyang201\n")
 
     # Footer
     lines.append("\n---")
