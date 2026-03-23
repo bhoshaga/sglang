@@ -7,7 +7,7 @@ raw.githubusercontent URLs in the dashboard markdown (GitHub Step Summary
 blocks data: URIs).
 
 Usage:
-    python3 scripts/ci/utils/publish_comparison_results.py \
+    python3 scripts/ci/utils/diffusion/publish_comparison_results.py \
         --results comparison-results.json \
         --dashboard dashboard.md \
         --charts-dir comparison-charts/

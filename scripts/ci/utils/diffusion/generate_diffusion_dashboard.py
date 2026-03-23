@@ -4,7 +4,7 @@ Reads current comparison results + historical data from sglang-ci-data repo
 and produces a Markdown report with tables and trend charts saved as PNG files.
 
 Usage:
-    python3 scripts/ci/utils/generate_diffusion_dashboard.py \
+    python3 scripts/ci/utils/diffusion/generate_diffusion_dashboard.py \
         --results comparison-results.json \
         --output dashboard.md \
         --charts-dir comparison-charts/ \
