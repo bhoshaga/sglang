@@ -30,6 +30,13 @@ elif [ "$1" = "gpus" ] && [ -n "$2" ]; then
     nvidia-smi
 
 else
+    # When CUDA_VISIBLE_DEVICES is set and --pid=host is used, multiple containers
+    # share the same PID namespace. Scope kills to this container's GPUs only.
+    if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
+        echo "Scoped kill: CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+        exec "$0" gpus "$CUDA_VISIBLE_DEVICES"
+    fi
+
     # Show current GPU status
     nvidia-smi
 
