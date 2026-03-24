@@ -52,6 +52,8 @@ from sglang.srt.speculative.spec_utils import (
     maybe_detect_nan,
     maybe_detect_oob,
     select_top_k_tokens,
+    spec_draft_extend_need_hidden_states,
+    spec_target_need_hidden_states,
 )
 from sglang.srt.utils.common import (
     MultiprocessingSerializer,
@@ -391,7 +393,11 @@ class EagleDraftWorker(BaseDraftWorker):
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
             draft_token_num=self.speculative_num_draft_tokens,
-            capture_hidden_mode=None,
+            capture_hidden_mode=(
+                CaptureHiddenMode.FULL
+                if spec_target_need_hidden_states(self.server_args)
+                else CaptureHiddenMode.NULL
+            ),
             seq_lens_sum=None,
             seq_lens_cpu=None,
         )
@@ -560,6 +566,8 @@ class EagleDraftWorker(BaseDraftWorker):
             - 1
         )
 
+        need_draft_hidden = spec_draft_extend_need_hidden_states(self.server_args)
+
         # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
             forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
@@ -568,6 +576,11 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.speculative_num_draft_tokens,
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
+                capture_hidden_mode=(
+                    CaptureHiddenMode.FULL
+                    if need_draft_hidden
+                    else CaptureHiddenMode.NULL
+                ),
             )
 
         if self.plan_stream:
@@ -601,12 +614,13 @@ class EagleDraftWorker(BaseDraftWorker):
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
             select_index
         ]
-        draft_logits_output.hidden_states = draft_logits_output.hidden_states[
-            select_index
-        ]
         probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
         ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
-        ret_hidden_states = draft_logits_output.hidden_states
+
+        if need_draft_hidden:
+            ret_hidden_states = draft_logits_output.hidden_states[select_index]
+        else:
+            ret_hidden_states = None
 
         # Construct the return values
         next_draft_input = batch_result.next_draft_input
@@ -693,7 +707,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
             or model_worker_batch.is_extend_in_batch
         ):
             # Target prefill
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            model_worker_batch.capture_hidden_mode = (
+                CaptureHiddenMode.FULL
+                if spec_target_need_hidden_states(self.server_args)
+                else CaptureHiddenMode.NULL
+            )
             batch_output = self.target_worker.forward_batch_generation(
                 model_worker_batch
             )

@@ -184,11 +184,18 @@ class EagleDraftInputV2Mixin:
         num_draft_tokens: int,
         draft_model_runner: Any,
         cuda_graph_runner: Any,
+        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL,
     ):
         seq_lens_cpu_ = batch.seq_lens_cpu
         extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
 
         batch.spec_info = self
+        draft_vocab_size = draft_model_runner.model_config.vocab_size
+        assert (
+            predict.max() <= draft_vocab_size
+        ), f"{predict.max()=} {draft_vocab_size=}"
+        # if predict.max() >= draft_vocab_size:
+        #     predict = predict.clamp(max=draft_vocab_size - 1)
         batch.input_ids = predict
         batch.seq_lens = batch.seq_lens + num_draft_tokens
         batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
@@ -196,7 +203,7 @@ class EagleDraftInputV2Mixin:
         batch.extend_seq_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
         batch.extend_prefix_lens = seq_lens_cpu_.tolist()
         batch.extend_num_tokens = extend_num_tokens
-        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        batch.capture_hidden_mode = capture_hidden_mode
         batch.forward_mode = (
             ForwardMode.IDLE
             if batch.forward_mode.is_idle()
@@ -251,7 +258,11 @@ class EagleVerifyInputV2Mixin:
             if batch.forward_mode.is_idle()
             else ForwardMode.TARGET_VERIFY
         )
-        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        batch.capture_hidden_mode = (
+            self.capture_hidden_mode
+            if self.capture_hidden_mode is not None
+            else CaptureHiddenMode.FULL
+        )
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
         # Run attention backend plan and cuda graph preparation
