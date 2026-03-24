@@ -2077,6 +2077,32 @@ def _distributed_worker(rank, world_size, backend, port, func, result_queue, kwa
 
 class CustomTestCase(unittest.TestCase):
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
+        # Wrap the effective setUpClass so that tearDownClass is called
+        # even when setUpClass fails. Python's unittest skips tearDownClass
+        # if setUpClass raises, which can leak resources (ports, processes).
+        setup = cls.setUpClass
+        if getattr(setup, "_safe_setup_wrapped", False):
+            return
+
+        @classmethod
+        def safe_setUpClass(klass, _orig=setup):
+            try:
+                _orig.__func__(klass)
+            except Exception:
+                # Best-effort cleanup; suppress teardown errors so the
+                # original setUpClass exception propagates clearly.
+                try:
+                    klass.tearDownClass()
+                except Exception:
+                    pass
+                raise
+
+        safe_setUpClass._safe_setup_wrapped = True
+        cls.setUpClass = safe_setUpClass
+
     def _callTestMethod(self, method):
         max_retry = envs.SGLANG_TEST_MAX_RETRY.get()
         if max_retry is None:
