@@ -1386,7 +1386,7 @@ class ServerArgs:
 
         return capture_sizes
 
-    def _set_default_nsa_kv_cache_dtype(self, major: int) -> str:
+    def _set_default_nsa_kv_cache_dtype(self, major: int, quantization: str) -> str:
         user_set_prefill = self.nsa_prefill_backend is not None
         user_set_decode = self.nsa_decode_backend is not None
 
@@ -1402,7 +1402,10 @@ class ServerArgs:
         if self.kv_cache_dtype == "auto":
             # TODO: Temporarily set default dtype on B200 as bfloat16 to avoid performance regression.
             # TODO: Remove this after the performance regression is fixed. (Ref: https://github.com/sgl-project/sglang/issues/21291)
-            self.kv_cache_dtype = "bfloat16"
+            if quantization == "modelopt_fp4" and major >= 10 and self.dp_size > 1:
+                self.kv_cache_dtype = "fp8_e4m3"
+            else:
+                self.kv_cache_dtype = "bfloat16"
             # self.kv_cache_dtype = (
             #     "fp8_e4m3" if (major >= 10 and self.dp_size > 1) else "bfloat16"
             # )
@@ -1559,7 +1562,7 @@ class ServerArgs:
                     import torch
 
                     major, _ = torch.cuda.get_device_capability()
-                    self._set_default_nsa_kv_cache_dtype(major)
+                    self._set_default_nsa_kv_cache_dtype(major, self.quantization)
                     self._set_default_nsa_backends(self.kv_cache_dtype, major)
 
                 if self.enable_nsa_prefill_context_parallel:
