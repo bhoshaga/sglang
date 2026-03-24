@@ -1400,9 +1400,12 @@ class ServerArgs:
             )
 
         if self.kv_cache_dtype == "auto":
-            self.kv_cache_dtype = (
-                "fp8_e4m3" if (major >= 10 and self.dp_size > 1) else "bfloat16"
-            )
+            # TODO: Temporarily set default dtype on B200 as bfloat16 to avoid performance regression.
+            # TODO: Remove this after the performance regression is fixed. (Ref: https://github.com/sgl-project/sglang/issues/21291)
+            self.kv_cache_dtype = "bfloat16"
+            # self.kv_cache_dtype = (
+            #     "fp8_e4m3" if (major >= 10 and self.dp_size > 1) else "bfloat16"
+            # )
             logger.warning(
                 f"Setting KV cache dtype to {self.kv_cache_dtype} for DeepSeek DSA on SM{major} device."
             )
