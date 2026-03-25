@@ -4,7 +4,7 @@ import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -299,10 +299,16 @@ class TestMamba(unittest.TestCase):
         print(available_and_evictable_str(tree))
         tree.sanity_check()
 
-    def _setup_tree_and_allocator(self):
+    def _setup_tree_and_allocator(self, enable_mamba_extra_buffer: bool = False):
         """Helper to create a MambaRadixCache with allocator for testing."""
         set_global_server_args_for_scheduler(
-            ServerArgs(model_path="dummy", page_size=1)
+            ServerArgs(
+                model_path="dummy",
+                page_size=1,
+                mamba_scheduler_strategy=(
+                    "extra_buffer" if enable_mamba_extra_buffer else "no_buffer"
+                ),
+            )
         )
         size = 128
         dtype = torch.bfloat16
@@ -340,7 +346,7 @@ class TestMamba(unittest.TestCase):
             device=device,
             enable_memory_saver=False,
             cache_params=mamba2_cache_params,
-            enable_mamba_extra_buffer=False,
+            enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=3,
         )
         pool = HybridLinearKVPool(
@@ -381,10 +387,87 @@ class TestMamba(unittest.TestCase):
                 origin_input_ids=[],
                 sampling_params=sampling_params,
             )
-            req_to_token_pool.alloc([req])
+            req.req_pool_idx = req_to_token_pool.alloc([req])[0]
             return req
 
         return tree, allocator, req_to_token_pool, make_dummy_req
+
+    def test_extra_buffer_prefill_tracks_reusable_aligned_boundary(self):
+        tree, allocator, req_to_token_pool, _ = self._setup_tree_and_allocator(
+            enable_mamba_extra_buffer=True
+        )
+
+        prompt_ids = list(range(128))
+        req = Req(
+            rid="req1",
+            origin_input_text="",
+            origin_input_ids=prompt_ids,
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req.req_pool_idx = req_to_token_pool.alloc([req])[0]
+        req.init_next_round_input(tree)
+
+        batch = ScheduleBatch(reqs=[req], req_to_token_pool=req_to_token_pool)
+        mamba_track_mask_cpu = []
+        mamba_track_indices_cpu = []
+        mamba_track_seqlens_cpu = []
+        batch._mamba_radix_cache_v2_req_prepare_for_extend(
+            req,
+            mamba_track_mask_cpu,
+            mamba_track_indices_cpu,
+            mamba_track_seqlens_cpu,
+        )
+
+        assert mamba_track_mask_cpu == [True]
+        assert req.mamba_last_track_seqlen == 64
+        assert mamba_track_seqlens_cpu == [65]
+
+        kv_indices = allocator.alloc(len(req.fill_ids))
+        req_to_token_pool.req_to_token[req.req_pool_idx, : len(req.fill_ids)] = (
+            kv_indices
+        )
+        tree.cache_unfinished_req(req)
+
+        req2 = Req(
+            rid="req2",
+            origin_input_text="",
+            origin_input_ids=prompt_ids,
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req2.req_pool_idx = req_to_token_pool.alloc([req2])[0]
+        req2.init_next_round_input(tree)
+
+        assert len(req2.prefix_indices) == 64
+        assert req2.mamba_branching_seqlen is None
+
+    def test_extra_buffer_keeps_full_aligned_boundary_for_chunked_prefill(self):
+        tree, _, req_to_token_pool, _ = self._setup_tree_and_allocator(
+            enable_mamba_extra_buffer=True
+        )
+
+        req = Req(
+            rid="chunked",
+            origin_input_text="",
+            origin_input_ids=list(range(128)),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req.req_pool_idx = req_to_token_pool.alloc([req])[0]
+        req.is_chunked = 1
+        req.init_next_round_input(tree)
+
+        batch = ScheduleBatch(reqs=[req], req_to_token_pool=req_to_token_pool)
+        mamba_track_mask_cpu = []
+        mamba_track_indices_cpu = []
+        mamba_track_seqlens_cpu = []
+        batch._mamba_radix_cache_v2_req_prepare_for_extend(
+            req,
+            mamba_track_mask_cpu,
+            mamba_track_indices_cpu,
+            mamba_track_seqlens_cpu,
+        )
+
+        assert mamba_track_mask_cpu == [True]
+        assert req.mamba_last_track_seqlen == 128
 
     def test_insert_prev_prefix_len(self):
         """Test that prev_prefix_len correctly controls which KV indices are freed

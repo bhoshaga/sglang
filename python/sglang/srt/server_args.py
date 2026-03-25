@@ -2147,6 +2147,12 @@ class ServerArgs:
                     "Disabling overlap schedule since mamba no_buffer is not compatible with "
                     "overlap schedule, try to use --disable-radix-cache if overlap schedule is necessary"
                 )
+                logger.warning(
+                    "Mamba radix cache with --mamba-scheduler-strategy no_buffer does not "
+                    "track branching states, so repeated generation prompts may see little "
+                    "or no prefix-cache reuse. Use --mamba-scheduler-strategy extra_buffer "
+                    "for effective repeated-prompt prefix caching."
+                )
                 self.disable_overlap_schedule = True
                 if self.attention_backend == "trtllm_mha":
                     logger.warning(
