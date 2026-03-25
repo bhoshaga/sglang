@@ -20,7 +20,9 @@ import subprocess
 import sys
 import time
 
-# Patterns for sglang server/worker processes (used only in ROCm fallback)
+MEMORY_THRESHOLD_PCT = 10
+
+# Process name patterns (ROCm fallback only — NVIDIA path uses GPU-scoped kills)
 SGLANG_PATTERNS = [
     r"sglang::",
     r"sglang\.launch_server",
@@ -30,14 +32,27 @@ SGLANG_PATTERNS = [
     r"sgl_diffusion::",
 ]
 
-# Patterns for test harness / orchestrator processes.
-# When found as an ancestor of a GPU process, killing these prevents respawning.
-TEST_HARNESS_PATTERNS = [
-    "run_suite.py",
-    "run_tests.py",
-]
+# Orchestrator patterns — when found as ancestors of GPU processes, kill to prevent respawn
+ORCHESTRATOR_PATTERNS = ["run_suite.py", "run_tests.py"]
 
-MEMORY_THRESHOLD_PCT = 10
+
+# ---------------------------------------------------------------------------
+# nvidia-smi helpers
+# ---------------------------------------------------------------------------
+
+
+def _run_smi(query, query_type="gpu"):
+    """Run nvidia-smi query and return raw CSV lines."""
+    flag = "--query-gpu" if query_type == "gpu" else "--query-compute-apps"
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", f"{flag}={query}", "--format=csv,noheader,nounits"],
+            text=True,
+            timeout=10,
+        )
+        return [l.strip() for l in out.strip().splitlines() if l.strip()]
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return []
 
 
 def get_target_gpus():
@@ -45,139 +60,75 @@ def get_target_gpus():
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
     if cvd is not None and cvd.strip():
         return [int(g.strip()) for g in cvd.split(",") if g.strip().isdigit()]
-    # If unset, target all GPUs
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-            text=True,
-            timeout=10,
-        )
-        return [int(line.strip()) for line in out.strip().splitlines() if line.strip()]
-    except (subprocess.SubprocessError, FileNotFoundError):
-        return []
+    return [int(l) for l in _run_smi("index")]
 
 
-def get_gpu_pids(gpu_indices):
-    """Return set of PIDs using the specified GPUs."""
+def get_gpu_uuid_map(gpu_indices):
+    """Return set of UUIDs for the given GPU indices."""
+    target_uuids = set()
+    for line in _run_smi("index,uuid"):
+        parts = line.split(",", 1)
+        if len(parts) == 2:
+            idx, uuid = int(parts[0].strip()), parts[1].strip()
+            if idx in gpu_indices:
+                target_uuids.add(uuid)
+    return target_uuids
+
+
+def get_gpu_pids(target_uuids):
+    """Return set of PIDs using GPUs with the given UUIDs."""
     pids = set()
-    try:
-        out = subprocess.check_output(
-            [
-                "nvidia-smi",
-                "--query-compute-apps=gpu_uuid,pid",
-                "--format=csv,noheader",
-            ],
-            text=True,
-            timeout=10,
-        )
-        # Get UUIDs for our target GPUs
-        uuid_out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
-            text=True,
-            timeout=10,
-        )
-        target_uuids = set()
-        for line in uuid_out.strip().splitlines():
-            parts = line.split(",")
-            if len(parts) == 2:
-                idx, uuid = int(parts[0].strip()), parts[1].strip()
-                if idx in gpu_indices:
-                    target_uuids.add(uuid)
-
-        for line in out.strip().splitlines():
-            parts = line.split(",")
-            if len(parts) == 2:
-                uuid, pid = parts[0].strip(), parts[1].strip()
-                if uuid in target_uuids and pid.isdigit():
-                    pids.add(int(pid))
-    except (subprocess.SubprocessError, FileNotFoundError):
-        pass
+    for line in _run_smi("gpu_uuid,pid", query_type="apps"):
+        parts = line.split(",", 1)
+        if len(parts) == 2:
+            uuid, pid = parts[0].strip(), parts[1].strip()
+            if uuid in target_uuids and pid.isdigit():
+                pids.add(int(pid))
     return pids
 
 
-def get_ancestor_pids(pids):
-    """Walk the process tree upward from the given PIDs.
+def get_gpu_memory(gpu_indices):
+    """Return dict of {gpu_index: (used_mib, total_mib)}."""
+    usage = {}
+    for line in _run_smi("index,memory.used,memory.total"):
+        parts = line.split(",")
+        if len(parts) == 3:
+            idx = int(parts[0].strip())
+            if idx in gpu_indices:
+                usage[idx] = (int(parts[1].strip()), int(parts[2].strip()))
+    return usage
 
-    Returns a set of ancestor PIDs that match TEST_HARNESS_PATTERNS.
-    These are orchestrator processes (run_suite.py, etc.) that would
-    respawn sglang servers if left alive.
-    """
+
+# ---------------------------------------------------------------------------
+# Process tree helpers
+# ---------------------------------------------------------------------------
+
+
+def get_orchestrator_ancestors(pids):
+    """Walk process tree upward from PIDs, return ancestors matching ORCHESTRATOR_PATTERNS."""
     ancestors = set()
     visited = set()
-
     for pid in pids:
         current = pid
         while current and current > 1 and current not in visited:
             visited.add(current)
             try:
-                with open(f"/proc/{current}/cmdline", "rb") as f:
-                    cmdline = f.read().decode("utf-8", errors="replace")
-                    cmdline = cmdline.replace("\x00", " ").strip()
+                cmdline = open(f"/proc/{current}/cmdline", "rb").read()
+                cmdline = cmdline.decode("utf-8", errors="replace").replace("\x00", " ")
+                if any(p in cmdline for p in ORCHESTRATOR_PATTERNS):
+                    ancestors.add(current)
             except (FileNotFoundError, PermissionError):
                 break
-
-            for pattern in TEST_HARNESS_PATTERNS:
-                if pattern in cmdline:
-                    ancestors.add(current)
-                    break
-
-            # Walk to parent
             try:
-                with open(f"/proc/{current}/stat") as f:
-                    stat = f.read().split()
-                    # Field 4 (0-indexed 3) is PPID
-                    ppid = int(stat[3])
-                    current = ppid
-            except (FileNotFoundError, PermissionError, (IndexError, ValueError)):
+                stat = open(f"/proc/{current}/stat").read().split()
+                current = int(stat[3])  # PPID
+            except (FileNotFoundError, PermissionError, IndexError, ValueError):
                 break
-
     return ancestors
 
 
-def get_child_pids(pids):
-    """Get all descendant PIDs of the given PIDs."""
-    children = set()
-    # Build parent->children map from /proc
-    parent_map = {}
-    try:
-        out = subprocess.check_output(
-            ["ps", "-eo", "pid,ppid", "--no-headers"], text=True, timeout=10
-        )
-        for line in out.strip().splitlines():
-            parts = line.split()
-            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-                child, parent = int(parts[0]), int(parts[1])
-                parent_map.setdefault(parent, set()).add(child)
-    except (subprocess.SubprocessError, FileNotFoundError):
-        return children
-
-    # BFS from given PIDs
-    queue = list(pids)
-    while queue:
-        pid = queue.pop(0)
-        for child in parent_map.get(pid, set()):
-            if child not in children:
-                children.add(child)
-                queue.append(child)
-    return children
-
-
-def get_pids_by_pattern(patterns):
-    """Return set of PIDs matching any of the given regex patterns."""
-    combined = "|".join(patterns)
-    pids = set()
-    try:
-        out = subprocess.check_output(["pgrep", "-f", combined], text=True, timeout=10)
-        for line in out.strip().splitlines():
-            if line.strip().isdigit():
-                pids.add(int(line.strip()))
-    except (subprocess.CalledProcessError, subprocess.SubprocessError):
-        pass
-    return pids
-
-
 def kill_pids(pids, label=""):
-    """Send SIGKILL to a set of PIDs. Skip our own PID."""
+    """Send SIGKILL to PIDs, skipping self and init."""
     my_pid = os.getpid()
     pids = {p for p in pids if p != my_pid and p > 1}
     if not pids:
@@ -193,35 +144,27 @@ def kill_pids(pids, label=""):
             print(f"  Warning: no permission to kill PID {pid}")
 
 
-def get_gpu_memory_usage(gpu_indices):
-    """Return dict of {gpu_index: (used_mib, total_mib)} for target GPUs."""
-    usage = {}
+def pgrep(patterns):
+    """Return PIDs matching regex patterns (for ROCm fallback)."""
+    pids = set()
     try:
         out = subprocess.check_output(
-            [
-                "nvidia-smi",
-                "--query-gpu=index,memory.used,memory.total",
-                "--format=csv,noheader,nounits",
-            ],
-            text=True,
-            timeout=10,
+            ["pgrep", "-f", "|".join(patterns)], text=True, timeout=10
         )
-        for line in out.strip().splitlines():
-            parts = line.split(",")
-            if len(parts) == 3:
-                idx = int(parts[0].strip())
-                if idx in gpu_indices:
-                    used = int(parts[1].strip())
-                    total = int(parts[2].strip())
-                    usage[idx] = (used, total)
-    except (subprocess.SubprocessError, FileNotFoundError):
+        pids = {int(l) for l in out.strip().splitlines() if l.strip().isdigit()}
+    except (subprocess.CalledProcessError, subprocess.SubprocessError):
         pass
-    return usage
+    return pids
+
+
+# ---------------------------------------------------------------------------
+# Main flows
+# ---------------------------------------------------------------------------
 
 
 def print_gpu_status(gpu_indices, header=""):
-    """Print memory usage for target GPUs."""
-    usage = get_gpu_memory_usage(gpu_indices)
+    """Print and return memory usage for target GPUs."""
+    usage = get_gpu_memory(gpu_indices)
     if header:
         print(f"\n{header}")
     for idx in sorted(usage):
@@ -231,24 +174,10 @@ def print_gpu_status(gpu_indices, header=""):
     return usage
 
 
-def check_memory_clean(gpu_indices):
-    """Check all target GPUs have <MEMORY_THRESHOLD_PCT% memory usage."""
-    usage = get_gpu_memory_usage(gpu_indices)
-    for idx in sorted(usage):
-        used, total = usage[idx]
-        if total > 0 and (used / total * 100) >= MEMORY_THRESHOLD_PCT:
-            return False
-    return True
-
-
 def run_nvidia_cleanup(gpu_indices):
-    """Main NVIDIA cleanup flow.
-
-    All kills are GPU-scoped: we start from PIDs on target GPUs (via nvidia-smi),
-    walk the process tree to find orchestrators, and kill the whole tree.
-    This ensures processes on other GPUs are never touched.
-    """
+    """GPU-scoped cleanup: find PIDs on target GPUs, kill their process trees."""
     target_set = set(gpu_indices)
+    target_uuids = get_gpu_uuid_map(target_set)
     print(f"Target GPUs: {sorted(target_set)}")
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
     if cvd is not None:
@@ -256,55 +185,40 @@ def run_nvidia_cleanup(gpu_indices):
 
     print_gpu_status(target_set, "Before cleanup:")
 
-    # Step 1: Find PIDs on our target GPUs
-    gpu_pids = get_gpu_pids(target_set)
+    # Step 1: Find PIDs on target GPUs, kill orchestrator ancestors first
+    gpu_pids = get_gpu_pids(target_uuids)
     if not gpu_pids:
         print("  No processes found on target GPUs")
     else:
-        # Step 2: Walk upward to find orchestrator ancestors (run_suite.py, etc.)
-        # Killing these first prevents them from respawning sglang servers.
-        ancestor_pids = get_ancestor_pids(gpu_pids)
-        if ancestor_pids:
-            # Also collect all descendants of ancestors (siblings on other tests, etc.)
-            descendant_pids = get_child_pids(ancestor_pids)
-            # Only kill descendants that are on our target GPUs or are the ancestors themselves
-            scoped_descendants = descendant_pids & gpu_pids
-            kill_pids(
-                ancestor_pids, "orchestrator processes (ancestors of GPU processes)"
-            )
-            if scoped_descendants - ancestor_pids:
-                kill_pids(scoped_descendants, "descendant processes on target GPUs")
+        ancestors = get_orchestrator_ancestors(gpu_pids)
+        if ancestors:
+            kill_pids(ancestors, "orchestrator ancestors")
+            time.sleep(1)
 
-        # Step 3: Kill GPU processes directly
-        # Re-query in case ancestors already cleaned up children
-        time.sleep(1)
-        gpu_pids = get_gpu_pids(target_set)
+        # Step 2: Kill remaining GPU processes
+        gpu_pids = get_gpu_pids(target_uuids)
         if gpu_pids:
             kill_pids(gpu_pids, "GPU processes")
 
-    # Wait for processes to die and GPU memory to free
     time.sleep(3)
 
-    # Step 4: Second pass — catch anything respawned or missed
-    gpu_pids = get_gpu_pids(target_set)
+    # Step 3: Second pass for stragglers
+    gpu_pids = get_gpu_pids(target_uuids)
     if gpu_pids:
-        print("  Second pass: processes still on GPUs")
-        kill_pids(gpu_pids, "stubborn GPU processes")
+        kill_pids(gpu_pids, "stubborn GPU processes (second pass)")
         time.sleep(3)
 
+    # Step 4: Verify
     usage = print_gpu_status(target_set, "After cleanup:")
-
-    # Step 5: Check if GPUs are clean
-    if not check_memory_clean(target_set):
-        dirty_gpus = []
-        for idx in sorted(usage):
-            used, total = usage[idx]
-            pct = (used / total * 100) if total > 0 else 0
-            if pct >= MEMORY_THRESHOLD_PCT:
-                dirty_gpus.append(f"GPU {idx} ({pct:.0f}%)")
+    dirty = [
+        f"GPU {i} ({u / t * 100:.0f}%)"
+        for i, (u, t) in sorted(usage.items())
+        if t > 0 and (u / t * 100) >= MEMORY_THRESHOLD_PCT
+    ]
+    if dirty:
         print(
             f"\nERROR: GPU memory still >={MEMORY_THRESHOLD_PCT}% after cleanup: "
-            f"{', '.join(dirty_gpus)}"
+            f"{', '.join(dirty)}"
         )
         print(
             "This indicates orphaned CUDA contexts that survive process kill. "
@@ -320,10 +234,8 @@ def run_nvidia_cleanup(gpu_indices):
 def run_rocm_cleanup():
     """ROCm cleanup — process-name kill only (no GPU query available)."""
     print("Running in ROCm mode")
-    harness_pids = get_pids_by_pattern(TEST_HARNESS_PATTERNS)
-    if harness_pids:
-        kill_pids(harness_pids, "test harness processes")
-    sglang_pids = get_pids_by_pattern(SGLANG_PATTERNS)
+    kill_pids(pgrep(ORCHESTRATOR_PATTERNS), "orchestrator processes")
+    sglang_pids = pgrep(SGLANG_PATTERNS)
     if sglang_pids:
         kill_pids(sglang_pids, "sglang processes")
     else:
@@ -334,12 +246,10 @@ def run_rocm_cleanup():
 def main():
     if "--rocm" in sys.argv:
         return run_rocm_cleanup()
-
     gpu_indices = get_target_gpus()
     if not gpu_indices:
         print("No GPUs detected, skipping cleanup")
         return 0
-
     return run_nvidia_cleanup(gpu_indices)
 
 
