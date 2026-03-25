@@ -90,12 +90,15 @@ runs:
               const jobs = response.data.jobs;
 
               // Handle pagination if >100 jobs
+              // ETag only covers page 1, so invalidate it to avoid stale cache
+              // when later pages change but page 1 doesn't.
               if (response.data.total_count > 100) {
+                lastEtag = '';
                 for (let page = 2; page <= Math.ceil(response.data.total_count / 100); page++) {
                   const { data: pageData } = await github.request(url, {
                     ...params,
                     page,
-                    headers: {}, // no etag for subsequent pages
+                    headers: {},
                   });
                   jobs.push(...pageData.jobs);
                 }
