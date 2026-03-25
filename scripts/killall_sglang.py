@@ -5,8 +5,7 @@ Called at the start of every CI job to clean up orphaned processes from
 previous (possibly cancelled) runs.
 
 Usage:
-    python killall_sglang.py          # Kill on CUDA_VISIBLE_DEVICES GPUs (or all if unset)
-    python killall_sglang.py --rocm   # ROCm mode (process-name kill only, no GPU query)
+    python killall_sglang.py
 
 Exit codes:
     0 - Clean: all target GPUs have <10% memory usage after cleanup
@@ -19,21 +18,9 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 MEMORY_THRESHOLD_PCT = 10
-
-# Process name patterns (ROCm fallback only — NVIDIA path uses GPU-scoped kills)
-SGLANG_PATTERNS = [
-    r"sglang::",
-    r"sglang\.launch_server",
-    r"sglang\.bench",
-    r"sglang\.data_parallel",
-    r"sglang\.srt",
-    r"sgl_diffusion::",
-]
-
-# Orchestrator patterns — ancestors of GPU processes; kill to prevent respawn
-ORCHESTRATOR_PATTERNS = ["run_suite.py", "run_tests.py"]
 
 
 def _run_smi(query, query_type="gpu"):
@@ -45,7 +32,7 @@ def _run_smi(query, query_type="gpu"):
             text=True,
             timeout=10,
         )
-        return [l.strip() for l in out.strip().splitlines() if l.strip()]
+        return [line.strip() for line in out.strip().splitlines() if line.strip()]
     except (subprocess.SubprocessError, FileNotFoundError):
         return []
 
@@ -54,19 +41,18 @@ def get_target_gpus():
     """Return GPU indices from CUDA_VISIBLE_DEVICES, or all visible GPUs."""
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
     if cvd is not None and cvd.strip():
-        return [int(g.strip()) for g in cvd.split(",") if g.strip().isdigit()]
-    return [int(l) for l in _run_smi("index")]
+        return {int(g.strip()) for g in cvd.split(",") if g.strip().isdigit()}
+    return {int(line) for line in _run_smi("index") if line.isdigit()}
 
 
 def get_gpu_pids(gpu_indices):
     """Return PIDs using the specified GPUs (by index)."""
-    # Build index→UUID mapping
     target_uuids = set()
     for line in _run_smi("index,uuid"):
         parts = line.split(",", 1)
-        if len(parts) == 2 and int(parts[0].strip()) in gpu_indices:
-            target_uuids.add(parts[1].strip())
-    # Find PIDs on those UUIDs
+        if len(parts) == 2 and parts[0].strip().isdigit():
+            if int(parts[0].strip()) in gpu_indices:
+                target_uuids.add(parts[1].strip())
     pids = set()
     for line in _run_smi("gpu_uuid,pid", query_type="apps"):
         parts = line.split(",", 1)
@@ -77,40 +63,49 @@ def get_gpu_pids(gpu_indices):
     return pids
 
 
-def get_gpu_memory(gpu_indices):
-    """Return {gpu_index: (used_mib, total_mib)} for target GPUs."""
-    usage = {}
+def _print_gpu_memory(gpu_indices, label=""):
+    """Print memory usage for target GPUs. Returns list of dirty GPU descriptions."""
+    if label:
+        print(f"\n{label}")
+    dirty = []
     for line in _run_smi("index,memory.used,memory.total"):
         parts = line.split(",")
-        if len(parts) == 3:
-            idx = int(parts[0].strip())
-            if idx in gpu_indices:
-                usage[idx] = (int(parts[1].strip()), int(parts[2].strip()))
-    return usage
+        if len(parts) != 3 or not parts[0].strip().isdigit():
+            continue
+        idx = int(parts[0].strip())
+        if idx not in gpu_indices:
+            continue
+        used, total = int(parts[1].strip()), int(parts[2].strip())
+        pct = used / total * 100 if total > 0 else 0
+        print(f"  GPU {idx}: {used} MiB / {total} MiB ({pct:.0f}%)")
+        if pct >= MEMORY_THRESHOLD_PCT:
+            dirty.append(f"GPU {idx} ({pct:.0f}%)")
+    return dirty
 
 
-def get_orchestrator_ancestors(pids):
-    """Walk process tree upward from PIDs, return ancestors matching ORCHESTRATOR_PATTERNS."""
+def _get_orchestrator_ancestors(pids):
+    """Walk process tree upward from PIDs, return ancestors that are test orchestrators."""
+    patterns = ["run_suite.py", "run_tests.py"]
     ancestors, visited = set(), set()
     for pid in pids:
         current = pid
         while current > 1 and current not in visited:
             visited.add(current)
             try:
-                cmdline = open(f"/proc/{current}/cmdline", "rb").read()
+                cmdline = Path(f"/proc/{current}/cmdline").read_bytes()
                 cmdline = cmdline.decode("utf-8", errors="replace").replace("\x00", " ")
-                if any(p in cmdline for p in ORCHESTRATOR_PATTERNS):
+                if any(p in cmdline for p in patterns):
                     ancestors.add(current)
             except (FileNotFoundError, PermissionError):
                 break
             try:
-                current = int(open(f"/proc/{current}/stat").read().split()[3])
+                current = int(Path(f"/proc/{current}/stat").read_text().split()[3])
             except (FileNotFoundError, PermissionError, IndexError, ValueError):
                 break
     return ancestors
 
 
-def kill_pids(pids, label=""):
+def _kill_pids(pids, label=""):
     """Send SIGKILL to PIDs, skipping self and init."""
     my_pid = os.getpid()
     pids = {p for p in pids if p != my_pid and p > 1}
@@ -125,54 +120,36 @@ def kill_pids(pids, label=""):
             pass
 
 
-def pgrep(patterns):
-    """Return PIDs matching regex patterns (for ROCm fallback)."""
-    try:
-        out = subprocess.check_output(
-            ["pgrep", "-f", "|".join(patterns)], text=True, timeout=10
-        )
-        return {int(l) for l in out.strip().splitlines() if l.strip().isdigit()}
-    except (subprocess.CalledProcessError, subprocess.SubprocessError):
-        return set()
+def main():
+    gpu_indices = get_target_gpus()
+    if not gpu_indices:
+        print("No GPUs detected, skipping cleanup")
+        return 0
 
-
-def run_nvidia_cleanup(gpu_indices):
-    """GPU-scoped cleanup: find PIDs on target GPUs, kill their process trees."""
-    target_set = set(gpu_indices)
-    print(f"Target GPUs: {sorted(target_set)}")
+    print(f"Target GPUs: {sorted(gpu_indices)}")
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
     if cvd is not None:
         print(f"CUDA_VISIBLE_DEVICES={cvd}")
 
-    # Show before state
-    for idx, (used, total) in sorted(get_gpu_memory(target_set).items()):
-        print(f"  GPU {idx}: {used} MiB / {total} MiB ({used / total * 100:.0f}%)")
+    _print_gpu_memory(gpu_indices, "Before cleanup:")
 
     # Kill orchestrator ancestors first, then GPU processes (retry once)
-    gpu_pids = get_gpu_pids(target_set)
+    gpu_pids = get_gpu_pids(gpu_indices)
     if not gpu_pids:
         print("  No processes found on target GPUs")
     else:
-        kill_pids(get_orchestrator_ancestors(gpu_pids), "orchestrator ancestors")
+        _kill_pids(_get_orchestrator_ancestors(gpu_pids), "orchestrator ancestors")
         time.sleep(1)
         for attempt in range(2):
-            gpu_pids = get_gpu_pids(target_set)
+            gpu_pids = get_gpu_pids(gpu_indices)
             if not gpu_pids:
                 break
             label = "GPU processes" if attempt == 0 else "stubborn GPU processes"
-            kill_pids(gpu_pids, label)
+            _kill_pids(gpu_pids, label)
             time.sleep(3)
 
     # Verify
-    usage = get_gpu_memory(target_set)
-    print("\nAfter cleanup:")
-    dirty = []
-    for idx, (used, total) in sorted(usage.items()):
-        pct = used / total * 100 if total > 0 else 0
-        print(f"  GPU {idx}: {used} MiB / {total} MiB ({pct:.0f}%)")
-        if pct >= MEMORY_THRESHOLD_PCT:
-            dirty.append(f"GPU {idx} ({pct:.0f}%)")
-
+    dirty = _print_gpu_memory(gpu_indices, "After cleanup:")
     if dirty:
         print(
             f"\nERROR: GPU memory >={MEMORY_THRESHOLD_PCT}% after cleanup: {', '.join(dirty)}"
@@ -181,29 +158,6 @@ def run_nvidia_cleanup(gpu_indices):
         return 1
     print("\nGPUs clean.")
     return 0
-
-
-def run_rocm_cleanup():
-    """ROCm cleanup — process-name kill only (no GPU query available)."""
-    print("Running in ROCm mode")
-    kill_pids(pgrep(ORCHESTRATOR_PATTERNS), "orchestrator processes")
-    sglang_pids = pgrep(SGLANG_PATTERNS)
-    (
-        kill_pids(sglang_pids, "sglang processes")
-        if sglang_pids
-        else print("  No sglang processes found")
-    )
-    return 0
-
-
-def main():
-    if "--rocm" in sys.argv:
-        return run_rocm_cleanup()
-    gpu_indices = get_target_gpus()
-    if not gpu_indices:
-        print("No GPUs detected, skipping cleanup")
-        return 0
-    return run_nvidia_cleanup(gpu_indices)
 
 
 if __name__ == "__main__":
