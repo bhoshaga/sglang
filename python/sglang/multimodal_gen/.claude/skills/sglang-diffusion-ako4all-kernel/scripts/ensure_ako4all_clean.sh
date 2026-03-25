@@ -4,7 +4,9 @@ set -euo pipefail
 BASE_DIR="${1:-$PWD}"
 BASE_DIR="$(cd "$BASE_DIR" && pwd)"
 AKO_DIR="${BASE_DIR}/AKO4ALL"
-DEFAULT_URL="${AKO4ALL_URL:-https://github.com/TongmingLAIC/AKO4ALL.git}"
+CANONICAL_UPSTREAM_URL="https://github.com/TongmingLAIC/AKO4ALL.git"
+UPSTREAM_URL="${AKO4ALL_UPSTREAM_URL:-$CANONICAL_UPSTREAM_URL}"
+CLONE_URL="${AKO4ALL_URL:-$UPSTREAM_URL}"
 
 say() {
   printf '[ako4all] %s\n' "$*"
@@ -16,8 +18,8 @@ fail() {
 }
 
 if [[ ! -d "$AKO_DIR/.git" ]]; then
-  say "AKO4ALL not found under ${BASE_DIR}; cloning ${DEFAULT_URL}"
-  git clone "$DEFAULT_URL" "$AKO_DIR"
+  say "AKO4ALL not found under ${BASE_DIR}; cloning ${CLONE_URL}"
+  git clone "$CLONE_URL" "$AKO_DIR"
 fi
 
 cd "$AKO_DIR"
@@ -27,9 +29,8 @@ if ! git remote get-url origin >/dev/null 2>&1; then
 fi
 
 if ! git remote get-url upstream >/dev/null 2>&1; then
-  origin_url="$(git remote get-url origin)"
-  say "Adding missing upstream remote -> ${origin_url}"
-  git remote add upstream "$origin_url"
+  say "Adding missing upstream remote -> ${UPSTREAM_URL}"
+  git remote add upstream "$UPSTREAM_URL"
 fi
 
 git fetch upstream --prune
