@@ -501,6 +501,7 @@ class LLaDA2MoeAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             attn_type=AttentionType.ENCODER_ONLY,
+            quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
 

@@ -154,6 +154,9 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        self.model.load_kv_cache_scales(quantization_param_path)
+
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
