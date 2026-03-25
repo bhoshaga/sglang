@@ -1137,15 +1137,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.pyt_hooks.register_hooks(self.model, module_prefix="model")
 
         if self.server_args.kv_cache_dtype in ("fp8_e4m3", "fp8_e5m2"):
-            if self.server_args.quantization_param_path is not None:
+            quantization_param_path = (
+                self.server_args.speculative_draft_quantization_param_path
+                if self.is_draft_worker
+                and self.server_args.speculative_draft_quantization_param_path
+                is not None
+                else self.server_args.quantization_param_path
+            )
+            if quantization_param_path is not None:
                 if callable(getattr(self.model, "load_kv_cache_scales", None)):
-                    self.model.load_kv_cache_scales(
-                        self.server_args.quantization_param_path
+                    scales_load_result = self.model.load_kv_cache_scales(
+                        quantization_param_path
                     )
-                    logger.info(
-                        "Loaded KV cache scaling factors from %s",
-                        self.server_args.quantization_param_path,
-                    )
+                    if scales_load_result is False:
+                        logger.warning(
+                            "KV cache scaling factors from %s were not applied to "
+                            "model %s. This worker is using default scaling "
+                            "factors of 1.0.",
+                            quantization_param_path,
+                            self.model.__class__.__name__,
+                        )
+                    else:
+                        logger.info(
+                            "Loaded KV cache scaling factors from %s",
+                            quantization_param_path,
+                        )
                 else:
                     raise RuntimeError(
                         "Using FP8 KV cache and scaling factors provided but "

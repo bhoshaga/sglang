@@ -14,6 +14,7 @@
 
 """Inference-only Qwen3_5 MTP model."""
 
+import json
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -21,7 +22,11 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -154,8 +159,47 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+    def load_kv_cache_scales(self, quantization_param_path: str) -> bool:
+        try:
+            with open(quantization_param_path, encoding="utf-8") as f:
+                schema = json.load(f)
+            scaling_factor = schema["kv_cache"]["scaling_factor"]
+            tp_rank = get_tensor_model_parallel_rank()
+            layer_scales = scaling_factor.get(str(tp_rank))
+            if layer_scales is None:
+                layer_scales = scaling_factor[tp_rank]
+        except FileNotFoundError:
+            logger.warning(
+                "Could not find speculative draft KV cache scale JSON at %s. "
+                "Using default scaling factors of 1.0 on the Qwen3.5 draft worker.",
+                quantization_param_path,
+            )
+            return False
+        except (json.JSONDecodeError, KeyError, TypeError):
+            logger.warning(
+                "Speculative draft KV cache scale JSON at %s is malformed. "
+                "Using default scaling factors of 1.0 on the Qwen3.5 draft worker.",
+                quantization_param_path,
+                exc_info=True,
+            )
+            return False
+
+        expected_layers = int(getattr(self.config, "num_hidden_layers", 0))
+        if len(layer_scales) != expected_layers:
+            logger.warning(
+                "Skipping external KV cache scale JSON for Qwen3.5 MTP draft model. "
+                "The provided JSON at %s describes %d layer(s), but the draft "
+                "worker materializes %d MTP layer(s). Use "
+                "--speculative-draft-quantization-param-path with a draft-specific "
+                "artifact.",
+                quantization_param_path,
+                len(layer_scales),
+                expected_layers,
+            )
+            return False
+
         self.model.load_kv_cache_scales(quantization_param_path)
+        return True
 
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False

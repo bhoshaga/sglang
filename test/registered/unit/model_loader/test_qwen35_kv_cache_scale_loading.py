@@ -1,3 +1,5 @@
+import json
+import tempfile
 import types
 import unittest
 from unittest.mock import MagicMock, patch
@@ -6,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
+from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 
 
 class DummyQwen35Config:
@@ -103,4 +106,59 @@ class TestQwen35KVCacheScaleLoading(unittest.TestCase):
         self.assertEqual(layer_three.attn.k_scale_float, 0.7)
         self.assertEqual(layer_three.attn.v_scale_float, 0.8)
         self.assertEqual(mock_tp_size.call_count, 1)
+        self.assertEqual(mock_tp_rank.call_count, 1)
+
+    @patch("sglang.srt.models.qwen3_5_mtp.logger.warning")
+    @patch("sglang.srt.models.qwen3_5_mtp.get_tensor_model_parallel_rank", return_value=0)
+    def test_mtp_load_kv_cache_scales_skips_target_model_json(
+        self, mock_tp_rank, mock_warning
+    ):
+        fake_mtp_model = types.SimpleNamespace(
+            config=types.SimpleNamespace(num_hidden_layers=1),
+            model=MagicMock(),
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(
+                {
+                    "model_type": "qwen3_5_text",
+                    "kv_cache": {
+                        "dtype": "float8_e4m3fn",
+                        "scaling_factor": {"0": {str(i): [1.0, 1.0] for i in range(64)}},
+                    },
+                },
+                f,
+            )
+            f.flush()
+            result = Qwen3_5ForCausalLMMTP.load_kv_cache_scales(fake_mtp_model, f.name)
+
+        self.assertFalse(result)
+        mock_warning.assert_called_once()
+        warning_args = mock_warning.call_args[0]
+        self.assertIn("Skipping external KV cache scale JSON", warning_args[0])
+        self.assertEqual(warning_args[2:], (64, 1))
+        self.assertEqual(mock_tp_rank.call_count, 1)
+        fake_mtp_model.model.load_kv_cache_scales.assert_not_called()
+
+    @patch("sglang.srt.models.qwen3_5_mtp.get_tensor_model_parallel_rank", return_value=0)
+    def test_mtp_load_kv_cache_scales_accepts_draft_specific_json(self, mock_tp_rank):
+        fake_mtp_model = types.SimpleNamespace(
+            config=types.SimpleNamespace(num_hidden_layers=1),
+            model=MagicMock(),
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(
+                {
+                    "model_type": "qwen3_5_text",
+                    "kv_cache": {
+                        "dtype": "float8_e4m3fn",
+                        "scaling_factor": {"0": {"0": [0.25, 0.5]}},
+                    },
+                },
+                f,
+            )
+            f.flush()
+            result = Qwen3_5ForCausalLMMTP.load_kv_cache_scales(fake_mtp_model, f.name)
+
+        self.assertTrue(result)
+        fake_mtp_model.model.load_kv_cache_scales.assert_called_once_with(f.name)
         self.assertEqual(mock_tp_rank.call_count, 1)
